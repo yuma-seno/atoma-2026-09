@@ -6,8 +6,8 @@ use serde_json::Value;
 use crate::domain::ports::{LlmPort, LlmResponse};
 use crate::domain::session::{Message, ToolCall, ToolCallFunction};
 use crate::infra::llm::shared::{
-    chat_response_to_llm, send_json_with_retry, ChatChoice, ChatResponse, PromptTokensDetails,
-    Usage, RESERVED_KEYS,
+    chat_response_to_llm, send_json_with_retry, tool_function, ChatChoice, ChatResponse,
+    PromptTokensDetails, Usage, RESERVED_KEYS,
 };
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -46,7 +46,7 @@ impl AnthropicClient {
         extra_body: &std::collections::HashMap<String, Value>,
     ) -> Result<ChatResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let body = build_request_body(model, messages, tools, extra_body);
+        let body = build_request_body(model, messages, tools, extra_body)?;
 
         tracing::debug!("Request URL: {}", url);
         tracing::debug!("Request body: {}", serde_json::to_string_pretty(&body)?);
@@ -154,8 +154,8 @@ fn build_request_body(
     messages: &[Message],
     tools: Option<&[Value]>,
     extra_body: &std::collections::HashMap<String, Value>,
-) -> Value {
-    let (system, mut anthropic_messages) = messages_to_anthropic(messages);
+) -> Result<Value> {
+    let (system, mut anthropic_messages) = messages_to_anthropic(messages)?;
     mark_last_message_cacheable(&mut anthropic_messages);
 
     let max_tokens = extra_body
@@ -176,7 +176,7 @@ fn build_request_body(
     }
 
     if let Some(tools) = tools {
-        body["tools"] = Value::Array(tools_to_anthropic(tools));
+        body["tools"] = Value::Array(tools_to_anthropic(tools)?);
         body["tool_choice"] = serde_json::json!({ "type": "auto" });
     }
 
@@ -195,7 +195,7 @@ fn build_request_body(
         }
     }
 
-    body
+    Ok(body)
 }
 
 /// Attaches an ephemeral cache-control breakpoint to the LAST content block
@@ -230,7 +230,7 @@ fn mark_last_message_cacheable(messages: &mut [Value]) {
     }
 }
 
-fn messages_to_anthropic(messages: &[Message]) -> (Option<String>, Vec<Value>) {
+fn messages_to_anthropic(messages: &[Message]) -> Result<(Option<String>, Vec<Value>)> {
     let mut system_content: Option<String> = None;
     let mut out: Vec<Value> = Vec::new();
 
@@ -270,7 +270,7 @@ fn messages_to_anthropic(messages: &[Message]) -> (Option<String>, Vec<Value>) {
             "tool" => {
                 let content = msg.content.clone().unwrap_or(Value::String(String::new()));
                 let content = mcp_blocks_to_anthropic(content);
-                let tool_use_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+                let tool_use_id = msg.tool_call_id_for_result()?;
                 out.push(serde_json::json!({
                     "role": "user",
                     "content": [{
@@ -284,7 +284,7 @@ fn messages_to_anthropic(messages: &[Message]) -> (Option<String>, Vec<Value>) {
         }
     }
 
-    (system_content, out)
+    Ok((system_content, out))
 }
 
 /// Rewrite MCP image blocks into Anthropic's shape, leaving everything else be.
@@ -326,11 +326,11 @@ fn mcp_blocks_to_anthropic(content: Value) -> Value {
     )
 }
 
-fn tools_to_anthropic(tools: &[Value]) -> Vec<Value> {
+fn tools_to_anthropic(tools: &[Value]) -> Result<Vec<Value>> {
     tools
         .iter()
         .map(|tool| {
-            let func = tool.get("function").unwrap_or(tool);
+            let func = tool_function(tool)?;
             let name = func.get("name").and_then(Value::as_str).unwrap_or_default();
             let description = func
                 .get("description")
@@ -340,11 +340,11 @@ fn tools_to_anthropic(tools: &[Value]) -> Vec<Value> {
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "name": name,
                 "description": description,
                 "input_schema": input_schema,
-            })
+            }))
         })
         .collect()
 }
@@ -506,7 +506,8 @@ mod tests {
             Message::system("you are a helpful agent"),
             Message::user("hi"),
         ];
-        let body = build_request_body("claude-x", &messages, None, &Default::default());
+        let body = build_request_body("claude-x", &messages, None, &Default::default())
+            .expect("these messages name their calls");
 
         let system = body.get("system").expect("system should be present");
         let blocks = system.as_array().expect("system should be a block array");
@@ -521,14 +522,16 @@ mod tests {
     #[test]
     fn no_system_key_when_there_is_no_system_message() {
         let messages = vec![Message::user("hi")];
-        let body = build_request_body("claude-x", &messages, None, &Default::default());
+        let body = build_request_body("claude-x", &messages, None, &Default::default())
+            .expect("these messages name their calls");
         assert!(body.get("system").is_none());
     }
 
     #[test]
     fn last_message_with_plain_string_content_is_converted_and_marked_cacheable() {
         let messages = vec![Message::user("first"), Message::user("second (latest)")];
-        let body = build_request_body("claude-x", &messages, None, &Default::default());
+        let body = build_request_body("claude-x", &messages, None, &Default::default())
+            .expect("these messages name their calls");
 
         let out_messages = body["messages"].as_array().unwrap();
         assert_eq!(out_messages.len(), 2);
@@ -552,7 +555,8 @@ mod tests {
         // cache_control breakpoint belongs on the LAST block regardless of
         // its type, including "tool_result".
         let messages = vec![Message::tool("call_1", "issue #42: title, body...")];
-        let body = build_request_body("claude-x", &messages, None, &Default::default());
+        let body = build_request_body("claude-x", &messages, None, &Default::default())
+            .expect("these messages name their calls");
 
         let out_messages = body["messages"].as_array().unwrap();
         assert_eq!(out_messages.len(), 1);
@@ -579,7 +583,8 @@ mod tests {
             },
         };
         let messages = vec![Message::assistant(Some("checking"), Some(vec![tool_call]))];
-        let body = build_request_body("claude-x", &messages, None, &Default::default());
+        let body = build_request_body("claude-x", &messages, None, &Default::default())
+            .expect("these messages name their calls");
 
         let out_messages = body["messages"].as_array().unwrap();
         let blocks = out_messages[0]["content"].as_array().unwrap();
@@ -594,7 +599,8 @@ mod tests {
 
     #[test]
     fn empty_messages_does_not_panic() {
-        let body = build_request_body("claude-x", &[], None, &Default::default());
+        let body = build_request_body("claude-x", &[], None, &Default::default())
+            .expect("these messages name their calls");
         assert_eq!(body["messages"].as_array().unwrap().len(), 0);
     }
 
@@ -603,7 +609,8 @@ mod tests {
         let mut extra = std::collections::HashMap::new();
         extra.insert("temperature".to_string(), serde_json::json!(0.5));
         let messages = vec![Message::user("hi")];
-        let body = build_request_body("claude-x", &messages, None, &extra);
+        let body = build_request_body("claude-x", &messages, None, &extra)
+            .expect("these messages name their calls");
         assert_eq!(body["temperature"], 0.5);
     }
 }
@@ -657,7 +664,7 @@ mod user_image_tests {
             {"type": "text", "text": "look at this"},
             {"type": "image", "data": "AAAA", "mimeType": "image/png"},
         ]));
-        let (_, out) = messages_to_anthropic(&[msg]);
+        let (_, out) = messages_to_anthropic(&[msg]).expect("a user message names no call");
         assert_eq!(out[0]["role"], "user");
         assert_eq!(out[0]["content"][1]["source"]["media_type"], "image/png");
         assert_eq!(out[0]["content"][1]["source"]["data"], "AAAA");

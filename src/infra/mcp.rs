@@ -392,26 +392,41 @@ impl McpConnection {
             .and_then(|t| t.as_array())
             .context("MCP server did not return tools array")?;
 
+        // A nameless entry fails the listing rather than being registered as `unknown`.
+        //
+        // MCP requires `name` on a tools/list entry, so this is not a second legitimate
+        // shape the way GitHub's seven pull request states are -- it is a server that is
+        // not answering the protocol. `unknown` registered it anyway: callable, liable
+        // to collide with the next nameless tool from the same server, and indexed under
+        // a name no schema in the catalogue matches. Named after the server, because
+        // that is what an adopter has to go and fix.
         let registered = tools
             .iter()
             .map(|tool| {
                 let tool_name = tool
                     .get("name")
                     .and_then(|n| n.as_str())
-                    .unwrap_or("unknown")
+                    .with_context(|| {
+                        format!(
+                            "MCP server '{}' listed a tool with no name, which the protocol \
+                             requires. Nothing can call it and nothing else it offers can be \
+                             trusted to be described correctly either.",
+                            self.name
+                        )
+                    })?
                     .to_string();
                 let prefixed = if self.unprefixed {
                     tool_name.clone()
                 } else {
                     format!("{}__{}", self.name, tool_name)
                 };
-                RegisteredTool {
+                Ok(RegisteredTool {
                     prefixed_name: prefixed,
                     tool_name,
                     schema: tool.clone(),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(registered)
     }
@@ -1313,8 +1328,18 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: &Value,
     ) -> Result<crate::domain::ports::ToolCallResult> {
-        let server_name = prefixed_name.split("__").next().unwrap_or("");
-        let hooks = self.hooks.get(server_name).cloned();
+        // The route, not the name. `self.hooks` is keyed by server name, and splitting
+        // the call's name on `__` only recovers one for a PREFIXED server: with
+        // `unprefixed: true` the prefixed name IS the bare tool name, so
+        // `"read_text_file".split("__").next()` answered `"read_text_file"`, no server
+        // was ever found under it, and every hook that server declared -- including its
+        // denylist and allowlist -- was skipped without a word. `routes` already holds
+        // the answer, put there by the same loop that registered the tool.
+        let hooks = self
+            .routes
+            .get(prefixed_name)
+            .and_then(|route| self.hooks.get(&route.server))
+            .cloned();
 
         if let Some(ref h) = hooks {
             hooks::check_access(h, prefixed_name)?;

@@ -59,37 +59,53 @@ async fn retry_delay(attempt: u8, reason: &str) {
 /// letting it through plainly would drop every MCP schema.
 pub const RESERVED_KEYS: [&str; 5] = ["model", "messages", "input", "system", "store"];
 
-/// Reconcile an `extra_body` `tools` value with the runtime tool definitions.
+/// The callable inside a tool definition.
 ///
-/// Returns the value to store, or `None` when a plain insert is correct.
+/// Atoma's internal representation of a tool IS Chat Completions' shape --
+/// `{"type": "function", "function": {…}}` -- and every producer emits it: the skill
+/// loader (`application::tools`), the MCP registry (`infra::mcp::tool_definitions`),
+/// and the test mock. `shared::chat_completion` sends that form verbatim, which is
+/// why it is the internal one.
 ///
-/// A plain insert would REPLACE the runtime tools. That silently strips every
-/// MCP tool's JSON Schema from the request, and because the system prompt lists
-/// only tool *names*, the model is then left to guess argument shapes — observed
-/// in production as a stream of wrong-typed and missing arguments.
-///
-/// OpenRouter's server tools (`{"type": "openrouter:web_search"}`) are declared
-/// in this same array and are documented to work alongside user-defined tools,
-/// so both sets belong in it: append rather than overwrite.
-fn reconcile_tools(runtime: Option<&Value>, extra: &Value) -> Option<Value> {
-    // No runtime tools to protect: whatever the agent supplied stands alone.
-    let runtime = runtime?.as_array()?;
+/// Both dialect adapters used to write `tool.get("function").unwrap_or(tool)`, which
+/// says a bare definition is a second legitimate shape. Nothing produces one. What
+/// the fallback actually did was turn a malformed definition into a tool named `""`
+/// with an empty schema, sent to the provider as though it were real.
+pub fn tool_function(tool: &Value) -> Result<&Value> {
+    tool.get("function").ok_or_else(|| {
+        anyhow::anyhow!(
+            "a tool definition has no `function` object: {}",
+            serde_json::to_string(tool).unwrap_or_else(|_| "<unserializable>".to_string())
+        )
+    })
+}
 
-    match extra.as_array() {
-        Some(extra) => {
-            let mut merged = runtime.clone();
-            merged.extend(extra.iter().cloned());
-            Some(Value::Array(merged))
-        }
-        None => {
-            tracing::warn!(
-                "extra_body.tools is not an array; ignoring it and keeping the \
-                 {} runtime tool definition(s)",
-                runtime.len(),
-            );
-            Some(Value::Array(runtime.clone()))
-        }
-    }
+/// Reconcile an agent's `extra_body.tools` with the runtime tool definitions.
+///
+/// Appending rather than replacing is the point. A plain insert would REPLACE the
+/// runtime tools, silently stripping every MCP tool's JSON Schema from the request —
+/// and because the system prompt lists only tool *names*, the model is then left to
+/// guess argument shapes, observed in production as a stream of wrong-typed and
+/// missing arguments.
+///
+/// OpenRouter's server tools (`{"type": "openrouter:web_search"}`) are declared in
+/// this same array and are documented to work alongside user-defined tools, so both
+/// sets belong in it.
+///
+/// Total, because its caller has already established that `extra` is an array. It
+/// used to take a `Value` and, when that was not an array, log a warning and keep the
+/// runtime tools — accepting a malformed declaration in place of refusing it, and
+/// leaving the agent's `tools` silently absent from the request it was written for.
+/// The check moved to [`merge_extra_body`], where it can be made once for every
+/// shape of that key rather than only when there are runtime tools to protect.
+fn reconcile_tools(runtime: Option<&Value>, extra: &[Value]) -> Value {
+    // No runtime tools to protect: whatever the agent supplied stands alone.
+    let Some(runtime) = runtime.and_then(Value::as_array) else {
+        return Value::Array(extra.to_vec());
+    };
+    let mut merged = runtime.clone();
+    merged.extend(extra.iter().cloned());
+    Value::Array(merged)
 }
 
 /// Merge an agent's `extra_body` into an assembled request body.
@@ -105,19 +121,30 @@ fn reconcile_tools(runtime: Option<&Value>, extra: &Value) -> Option<Value> {
 pub fn merge_extra_body(
     body: &mut serde_json::Map<String, Value>,
     extra_body: &std::collections::HashMap<String, Value>,
-) {
+) -> Result<()> {
     for (key, value) in extra_body {
         if RESERVED_KEYS.contains(&key.as_str()) {
             continue;
         }
         if key == "tools" {
-            if let Some(reconciled) = reconcile_tools(body.get("tools"), value) {
-                body.insert(key.clone(), reconciled);
-                continue;
-            }
+            // Checked here rather than inside `reconcile_tools`, so the answer does not
+            // depend on whether there happened to be runtime tools to merge with. A
+            // `tools` that is not an array used to be a warning on one path and a plain
+            // insert on the other -- the same malformed declaration, tolerated twice in
+            // two different ways, with the agent's own tools going nowhere either time.
+            let extra = value.as_array().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this agent's `extra_body.tools` is not an array, so it cannot be \
+                     added to the tools this run offers. Write it as a list of tool \
+                     definitions, or remove it."
+                )
+            })?;
+            body.insert(key.clone(), reconcile_tools(body.get("tools"), extra));
+            continue;
         }
         body.insert(key.clone(), value.clone());
     }
+    Ok(())
 }
 
 /// Shared HTTP response types (OpenAI-compatible wire format).
@@ -410,7 +437,7 @@ pub async fn openai_compat_call(
     }
 
     if let Some(obj) = body.as_object_mut() {
-        merge_extra_body(obj, extra_body);
+        merge_extra_body(obj, extra_body)?;
     }
 
     tracing::debug!("Request URL: {}", url);
@@ -678,7 +705,7 @@ mod tests {
             ]),
         )]);
 
-        merge_extra_body(&mut body, &extra);
+        merge_extra_body(&mut body, &extra).expect("these keys merge");
 
         assert_eq!(
             tool_names(&body),
@@ -703,22 +730,24 @@ mod tests {
             serde_json::json!([{ "type": "openrouter:web_search" }]),
         )]);
 
-        merge_extra_body(&mut body, &extra);
+        merge_extra_body(&mut body, &extra).expect("these keys merge");
 
         assert_eq!(tool_names(&body), vec!["openrouter:web_search"]);
     }
 
+    /// It used to warn and keep the runtime tools, which reads as "handled" and is
+    /// not: the agent declared tools that never reached the request, and only a log
+    /// line nobody was watching said so. The same value with no runtime tools to
+    /// protect was inserted verbatim, so one malformed declaration had two different
+    /// tolerations and no refusal.
     #[test]
-    fn a_non_array_extra_body_tools_cannot_strip_the_runtime_tools() {
+    fn a_non_array_extra_body_tools_is_refused_rather_than_absorbed() {
         let mut body = body_with_runtime_tools();
         let extra = HashMap::from([("tools".to_string(), serde_json::json!("web_search"))]);
 
-        merge_extra_body(&mut body, &extra);
-
-        assert_eq!(
-            tool_names(&body),
-            vec!["github__get_issue", "atoma_builtin__load_skill"]
-        );
+        let refused =
+            merge_extra_body(&mut body, &extra).expect_err("a string is not a tool list");
+        assert!(refused.to_string().contains("not an array"), "{refused}");
     }
 
     #[test]
@@ -735,7 +764,7 @@ mod tests {
             ),
         ]);
 
-        merge_extra_body(&mut body, &extra);
+        merge_extra_body(&mut body, &extra).expect("these keys merge");
 
         assert_eq!(body["model"], serde_json::json!("test-model"));
         assert_eq!(body["messages"], serde_json::json!([]));

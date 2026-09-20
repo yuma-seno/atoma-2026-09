@@ -125,10 +125,24 @@ pub fn validate(
             }
         }
 
-        // No `tools` shape check here. A non-array is not fatal -- `reconcile_tools` keeps
-        // the runtime definitions and warns at run time -- and this function reports only
-        // errors, so its only way to speak was to call a tolerated configuration invalid.
-        // Being stricter than the code it describes is its own kind of wrong answer.
+        // A `tools` that is not an array is refused HERE, where the person who wrote it
+        // is reading, rather than at the first request that uses the agent.
+        //
+        // This check was here once, was removed, and the removal is the clearest example
+        // of what a tolerance costs. `reconcile_tools` had grown an arm that warned and
+        // kept the runtime definitions instead of refusing, and the comment that replaced
+        // this check said so: "being stricter than the code it describes is its own kind
+        // of wrong answer". Correct, and backwards -- the code was wrong, and making the
+        // validator agree with it removed the last thing that could have said so.
+        if let Some(tools) = agent.extra_body.get("tools") {
+            if !tools.is_array() {
+                errors.push(
+                    "extra_body.tools must be an array of tool definitions; \
+                     it cannot be added to this run's tools as written"
+                        .to_string(),
+                );
+            }
+        }
 
         if let Some(ref tools_path) = tools_file {
             match tool_def_port.load(tools_path) {
@@ -518,21 +532,25 @@ mod tests {
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
-    // A non-array `tools` is TOLERATED: `reconcile_tools` keeps the runtime definitions
-    // and warns. This used to assert the opposite, pinning a validator that was stricter
-    // than the code it described.
+    /// This test asserted the opposite for a while, and the reason is worth keeping:
+    /// `reconcile_tools` had been relaxed to warn instead of refuse, and the validator
+    /// was then relaxed to agree with it. Two places accepted a declaration neither
+    /// could act on, and the agent's tools reached no request either way.
     #[test]
-    fn a_non_array_tools_is_not_a_validation_failure() {
+    fn a_non_array_tools_fails_validation() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_agent(dir.path(), "solo", "extra_body:\n  tools: web_search\n");
-        assert!(validate(
-            path,
-            None,
-            None,
-            &FileAgentDefAdapter,
-            &FileToolDefAdapter::default()
-        )
-        .is_ok());
+        assert!(
+            validate(
+                path,
+                None,
+                None,
+                &FileAgentDefAdapter,
+                &FileToolDefAdapter::default()
+            )
+            .is_err(),
+            "a string is not a list of tool definitions"
+        );
     }
 
     /// Every key any adapter assembles itself. `input` and `system` are the two that
