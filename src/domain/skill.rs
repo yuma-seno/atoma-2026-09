@@ -124,7 +124,9 @@ mod skill_called_as_tool_tests {
     fn the_corrected_call_names_the_argument_the_tool_takes() {
         let message = skill_called_as_tool_message("engineering/tdd").expect("a skill path");
         assert!(
-            message.contains(&format!(r#"{{"{LOAD_SKILL_ARGUMENT}": "engineering/tdd"}}"#)),
+            message.contains(&format!(
+                r#"{{"{LOAD_SKILL_ARGUMENT}": "engineering/tdd"}}"#
+            )),
             "{message}"
         );
     }
