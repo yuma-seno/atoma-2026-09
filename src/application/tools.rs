@@ -75,13 +75,13 @@ impl RuntimeTools {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {
+                        "skill_name": {
                             "type": "string",
                             "description": "Exact skill name from the Available Skills catalog.",
                             "enum": names,
                         }
                     },
-                    "required": ["name"],
+                    "required": ["skill_name"],
                     "additionalProperties": false,
                 }
             }
@@ -89,46 +89,46 @@ impl RuntimeTools {
     }
 }
 
-/// The skill a call names, whatever key it used.
+/// The skill a call names.
 ///
-/// `name` first, because that is the schema and the only key the model is told
-/// about. Then the names it reaches for instead, then -- when the object holds one
-/// string and nothing else -- that string, because a single value under a single
-/// unexpected key is not ambiguous.
+/// One key, the one the schema declares. Anything else is refused, and
+/// [`skill_argument_message`] writes out the call that would have worked.
 ///
-/// Measured over 169 calls in one repository, 75 failed, all of them here, all of
-/// them because the argument was called `skill_name` (56), `skill` (15) or
-/// `skill_id`. The schema says `name`, is marked required, and carries an `enum` of
-/// every skill; none of that stopped it, and a second measurement in a different
-/// repository found the same share again -- 77 of 187.
+/// ## Why the argument is `skill_name`
 ///
-/// The refusal below already read the value out to write the corrected call. Having
-/// recovered it, spending a round trip and a model turn to hand it back was a cost
-/// with nothing bought: the tool takes one required string, so there was never a
-/// second reading to choose between.
+/// It was `name`, and 75 of 169 calls in one repository failed here -- every one of
+/// them a run that had chosen the right skill, named it correctly, and got nothing. A
+/// second repository found the same share again, 77 of 187. The schema was marked
+/// required and carried an `enum` of every skill; none of that stopped it.
+///
+/// What the models wrote instead was measured, not guessed: `skill_name` 56 times,
+/// `skill` 15, `skill_id` the rest. `name` alone asks "name of what" in an object that
+/// answers nothing, and they disambiguated it the same way nearly every time. So the
+/// argument is called `skill_name`, because that is the name it turned out to have.
+///
+/// ## Why nothing else is accepted
+///
+/// It used to accept `skill`, `skill_name` and `skill_id` as well, and any lone string
+/// under any key. That removed the failures and left the cause: with the wrong calls
+/// working, nothing measured whether the name was right, and the tolerance was what
+/// made a badly named argument survivable.
+///
+/// Accepting them was cheap -- the refusal below already reads the value out to write
+/// the corrected call, so handing it back cost a round trip and bought nothing. That
+/// argument still holds in isolation, and it is not the one that decides: a tool with
+/// four spellings has no name, and one round trip on a call that should now be rare is
+/// what it costs to have one.
 fn named_skill(arguments: &Value) -> Option<&str> {
-    const ALIASES: [&str; 3] = ["skill", "skill_name", "skill_id"];
-    let object = arguments.as_object()?;
-    if let Some(name) = object.get("name").and_then(Value::as_str) {
-        return Some(name);
-    }
-    for alias in ALIASES {
-        if let Some(name) = object.get(alias).and_then(Value::as_str) {
-            return Some(name);
-        }
-    }
-    let mut strings = object.values().filter_map(Value::as_str);
-    let only = strings.next()?;
-    strings.next().is_none().then_some(only)
+    arguments.as_object()?.get("skill_name")?.as_str()
 }
 
-/// What to say when a skill call carries no skill at all.
+/// What to say when a skill call does not carry `skill_name`.
 ///
-/// Only reached once [`named_skill`] has failed to find one, which is a call carrying
-/// no string, or several with nothing to choose between them. The keys models reach
-/// for instead of `name` are read rather than refused; see there for the measurement.
+/// This is where every wrong spelling lands now, so it is the whole of what makes one
+/// survivable: it has to leave the run able to continue, in one turn, without the
+/// model having to work out what was wrong.
 ///
-/// The message hands back the call that would have worked rather than restating the
+/// So the message hands back the call that would have worked rather than restating the
 /// schema. Measured elsewhere in this project, a refusal naming the next action is
 /// taken and one that only states a rule is not -- twice, on two different guards.
 fn skill_argument_message(arguments: &Value) -> String {
@@ -152,11 +152,11 @@ fn skill_argument_message(arguments: &Value) -> String {
 
     match guess {
         Some(value) => format!(
-            "This tool takes its argument as 'name'. You passed {}. Call it again with {{\"name\": \"{}\"}}.",
+            "This tool takes its argument as 'skill_name'. You passed {}. Call it again with {{\"skill_name\": \"{}\"}}.",
             received, value
         ),
         None => format!(
-            "This tool takes its argument as 'name', a string naming one skill from the Available Skills catalog. You passed {}.",
+            "This tool takes its argument as 'skill_name', a string naming one skill from the Available Skills catalog. You passed {}.",
             received
         ),
     }
@@ -239,7 +239,7 @@ mod tests {
         let definitions = tools.tool_definitions();
         assert_eq!(tool_name(&definitions[0]), Some(LOAD_SKILL_TOOL));
         assert_eq!(
-            definitions[0].pointer("/function/parameters/properties/name/enum/0"),
+            definitions[0].pointer("/function/parameters/properties/skill_name/enum/0"),
             Some(&Value::String("engineering/tdd".to_string()))
         );
 
@@ -247,7 +247,7 @@ mod tests {
             .call_tool(
                 "engineer",
                 LOAD_SKILL_TOOL,
-                &serde_json::json!({"name": "engineering/tdd"}),
+                &serde_json::json!({"skill_name": "engineering/tdd"}),
             )
             .await
             .unwrap();
@@ -256,29 +256,50 @@ mod tests {
         assert!(!result.session_ends);
     }
 
-    /// The keys the models actually used, in the order the measurement found them.
+    /// Every spelling but the schema's is refused, and told what to call instead.
     ///
-    /// 56 of 75 failures were `skill_name`, 15 were `skill`. Each of these was a run
-    /// that had chosen the right skill, named it correctly, and got nothing.
+    /// These are the keys the measurement found: 56 of 75 failures were `skill_name`,
+    /// 15 were `skill`. `skill_name` is now the schema, so that share of them stops
+    /// being a failure at all. The rest are refused rather than forgiven -- a tool with
+    /// four spellings has no name -- and the refusal carries the corrected call, so the
+    /// run continues in one turn.
     #[tokio::test]
-    async fn a_skill_named_under_another_key_still_loads() {
-        for key in ["name", "skill", "skill_name", "skill_id", "unexpected"] {
+    async fn only_the_schemas_key_loads_a_skill() {
+        for key in ["name", "skill", "skill_id", "unexpected"] {
             let mut tools = RuntimeTools::new(catalog(), None).unwrap();
             let mut arguments = serde_json::Map::new();
             arguments.insert(
                 key.to_string(),
                 serde_json::Value::String("engineering/tdd".to_string()),
             );
-            let result = tools
+            let error = tools
                 .call_tool(
                     "engineer",
                     LOAD_SKILL_TOOL,
                     &serde_json::Value::Object(arguments),
                 )
                 .await
-                .unwrap_or_else(|e| panic!("{key}: {e}"));
-            assert!(result.content.contains("# Skill: engineering/tdd"), "{key}");
+                .expect_err(key);
+            let message = error.to_string();
+            assert!(
+                message.contains(r#"{"skill_name": "engineering/tdd"}"#),
+                "{key}: {message}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn the_schemas_key_loads_a_skill() {
+        let mut tools = RuntimeTools::new(catalog(), None).unwrap();
+        let result = tools
+            .call_tool(
+                "engineer",
+                LOAD_SKILL_TOOL,
+                &serde_json::json!({"skill_name": "engineering/tdd"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.content.contains("# Skill: engineering/tdd"));
     }
 
     #[tokio::test]
@@ -288,7 +309,7 @@ mod tests {
             .call_tool(
                 "engineer",
                 LOAD_SKILL_TOOL,
-                &serde_json::json!({"name": "missing"}),
+                &serde_json::json!({"skill_name": "missing"}),
             )
             .await
             .unwrap_err();
@@ -300,14 +321,12 @@ mod tests {
         assert!(message.contains("engineering/tdd"), "{}", message);
     }
 
-    /// The failure this replaced: 75 of 169 calls in one repository, every one of them
-    /// passing the skill under a key that was not `name`. A message that restates the
-    /// schema is a message the caller has already read past.
-    /// A call this cannot read still names the call that works.
+    /// A call carrying several strings still names the call that works.
     ///
-    /// `skill_name` used to land here and loads now. What is left is a call carrying no
-    /// string at all, or several with nothing to choose between them -- and the message
-    /// has the same job to do for those.
+    /// One wrong key is guessable and the message writes it out. Several are not, so it
+    /// picks the first and says what it received -- which is still a call the model can
+    /// correct in one turn, and still not a restatement of the schema the caller has
+    /// already read past.
     #[tokio::test]
     async fn an_unreadable_argument_is_told_what_to_call_instead() {
         let mut tools = RuntimeTools::new(catalog(), None).unwrap();
@@ -323,7 +342,7 @@ mod tests {
         assert!(message.contains("first"), "{}", message);
         // The corrected call, in full, so following it needs no interpretation.
         assert!(
-            message.contains(r#"{"name": "engineering/tdd"}"#),
+            message.contains(r#"{"skill_name": "engineering/tdd"}"#),
             "{}",
             message
         );
@@ -339,6 +358,23 @@ mod tests {
             .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("no arguments"), "{}", message);
-        assert!(message.contains("'name'"), "{}", message);
+        assert!(message.contains("'skill_name'"), "{}", message);
+    }
+
+    /// The schema name itself, because it is the whole of the fix.
+    ///
+    /// The aliases below it mean a call under the old name still works, so nothing else
+    /// in this file would fail if the property drifted back to `name` -- the measured
+    /// failure would simply return, silently, one release later.
+    #[test]
+    fn the_schema_asks_for_the_name_the_models_write() {
+        let tools = RuntimeTools::new(catalog(), None).unwrap();
+        let definition = tools.load_skill_definition();
+        let parameters = &definition["function"]["parameters"];
+        assert!(
+            parameters["properties"]["skill_name"].is_object(),
+            "{definition}"
+        );
+        assert_eq!(parameters["required"], serde_json::json!(["skill_name"]));
     }
 }
