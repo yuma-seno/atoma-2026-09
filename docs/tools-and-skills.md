@@ -256,7 +256,7 @@ At prompt build time, Atoma reveals only skill metadata in `AVAILABLE_SKILLS`.
 
 When an agent needs details, it calls:
 
-- `atoma_builtin__load_skill` with `{"name":"..."}`
+- `atoma_builtin__load_skill` with `{"skill_name":"..."}`
 
 Tool result returns full skill instructions as normal tool output, which is persisted in session history like any other tool call.
 
