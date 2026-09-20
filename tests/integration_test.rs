@@ -266,7 +266,7 @@ async fn test_skill_load_is_persisted_as_tool_history() {
     use atoma::application::tools::LOAD_SKILL_TOOL;
     use common::mock_llm::make_tool_call;
 
-    let tool_call = make_tool_call("skill-1", LOAD_SKILL_TOOL, r#"{"name":"engineering/tdd"}"#);
+    let tool_call = make_tool_call("skill-1", LOAD_SKILL_TOOL, r#"{"skill_name":"engineering/tdd"}"#);
     let llm = MockLlmClient::new()
         .enqueue_tool_calls(vec![tool_call])
         .enqueue_text("Applied the skill.");
