@@ -11,6 +11,21 @@ use std::collections::BTreeMap;
 /// build time.
 pub const LOAD_SKILL_TOOL: &str = "atoma_builtin__load_skill";
 
+/// The name of that tool's one argument.
+///
+/// Here rather than in `application` for the same reason as the tool name above, and
+/// shared for a sharper one: it is spelled in two places that cannot see each other --
+/// the schema `application::tools` declares, and the corrected call
+/// [`skill_called_as_tool_message`] writes out for a model to copy. They drifted. The
+/// message went on teaching `{"name": ...}` after the schema became `skill_name` and
+/// every other spelling stopped being accepted, so following the message exactly was a
+/// refusal.
+///
+/// Nothing caught it: the argument key is a JSON string built on one side and a JSON
+/// string built on the other, and the tests below assert the message names the tool and
+/// the skill, never the key. One constant is what makes the two agree.
+pub const LOAD_SKILL_ARGUMENT: &str = "skill_name";
+
 /// What to say when a tool call names a skill instead of a tool.
 ///
 /// A reviewer called `engineering/environment` as a tool and was told only "Invalid tool
@@ -34,7 +49,8 @@ pub fn skill_called_as_tool_message(name: &str) -> Option<String> {
     }
     Some(format!(
         "'{name}' is a skill, not a tool. A skill is loaded, not called: use {LOAD_SKILL_TOOL} \
-         with {{\"name\": \"{name}\"}}, then follow what it returns. Nothing has run yet."
+         with {{\"{LOAD_SKILL_ARGUMENT}\": \"{name}\"}}, then follow what it returns. \
+         Nothing has run yet."
     ))
 }
 
@@ -84,7 +100,7 @@ impl SkillCatalog {
 
 #[cfg(test)]
 mod skill_called_as_tool_tests {
-    use super::{skill_called_as_tool_message, LOAD_SKILL_TOOL};
+    use super::{skill_called_as_tool_message, LOAD_SKILL_ARGUMENT, LOAD_SKILL_TOOL};
 
     /// The property is that the message names the call that works. A reviewer that saw
     /// only "expected server__tool" went on to tell a pull request it had run the skill.
@@ -94,6 +110,23 @@ mod skill_called_as_tool_tests {
             skill_called_as_tool_message("engineering/environment").expect("a skill path");
         assert!(message.contains(LOAD_SKILL_TOOL));
         assert!(message.contains("engineering/environment"));
+    }
+
+    /// The corrected call is one a model copies verbatim, so the argument's name has to
+    /// be the one the tool takes.
+    ///
+    /// It was not. This message went on writing `{"name": ...}` after the schema became
+    /// `skill_name` and every other spelling stopped being accepted, which made following
+    /// it exactly a refusal. Nothing caught it: the key was a JSON string built here and
+    /// a JSON string built in `application::tools`, and the assertions above name the
+    /// tool and the skill but never the key.
+    #[test]
+    fn the_corrected_call_names_the_argument_the_tool_takes() {
+        let message = skill_called_as_tool_message("engineering/tdd").expect("a skill path");
+        assert!(
+            message.contains(&format!(r#"{{"{LOAD_SKILL_ARGUMENT}": "engineering/tdd"}}"#)),
+            "{message}"
+        );
     }
 
     /// It has to say that nothing happened, because the failure this came from was an

@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::domain::ports::{ToolCallResult, ToolPort};
 use crate::domain::skill::SkillCatalog;
 
-pub use crate::domain::skill::LOAD_SKILL_TOOL;
+pub use crate::domain::skill::{LOAD_SKILL_ARGUMENT, LOAD_SKILL_TOOL};
 const BUILTIN_PREFIX: &str = "atoma_builtin__";
 
 /// What the model is told about skills, at the moment it is choosing a tool.
@@ -75,13 +75,13 @@ impl RuntimeTools {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "skill_name": {
+                        LOAD_SKILL_ARGUMENT: {
                             "type": "string",
                             "description": "Exact skill name from the Available Skills catalog.",
                             "enum": names,
                         }
                     },
-                    "required": ["skill_name"],
+                    "required": [LOAD_SKILL_ARGUMENT],
                     "additionalProperties": false,
                 }
             }
@@ -119,7 +119,7 @@ impl RuntimeTools {
 /// four spellings has no name, and one round trip on a call that should now be rare is
 /// what it costs to have one.
 fn named_skill(arguments: &Value) -> Option<&str> {
-    arguments.as_object()?.get("skill_name")?.as_str()
+    arguments.as_object()?.get(LOAD_SKILL_ARGUMENT)?.as_str()
 }
 
 /// What to say when a skill call does not carry `skill_name`.
