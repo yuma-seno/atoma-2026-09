@@ -469,8 +469,8 @@ mod tests {
 
     #[test]
     fn a_user_message_keeps_its_role_and_content() {
-        let input = messages_to_input(&[Message::user("hello")])
-            .expect("these messages name their calls");
+        let input =
+            messages_to_input(&[Message::user("hello")]).expect("these messages name their calls");
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"], "hello");
     }

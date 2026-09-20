@@ -745,8 +745,7 @@ mod tests {
         let mut body = body_with_runtime_tools();
         let extra = HashMap::from([("tools".to_string(), serde_json::json!("web_search"))]);
 
-        let refused =
-            merge_extra_body(&mut body, &extra).expect_err("a string is not a tool list");
+        let refused = merge_extra_body(&mut body, &extra).expect_err("a string is not a tool list");
         assert!(refused.to_string().contains("not an array"), "{refused}");
     }
 
