@@ -118,6 +118,26 @@ impl Message {
         }
     }
 
+    /// The call this tool result answers.
+    ///
+    /// An error rather than a placeholder. Both constructors above take a
+    /// `tool_call_id` and neither can be called without one, so a `role: "tool"`
+    /// message without it did not come from this program -- a hand-edited session, or
+    /// one written by something else. The adapters used to send `"unknown"` in its
+    /// place, which is not a call id any provider has ever issued: Anthropic matches
+    /// `tool_use_id` against a preceding `tool_use` and rejects the request, so the
+    /// fabrication bought a 400 with a made-up id in it instead of a sentence naming
+    /// the real problem.
+    pub fn tool_call_id_for_result(&self) -> anyhow::Result<&str> {
+        self.tool_call_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "a tool result in this session names no tool call, so there is nothing \
+                 for the provider to match it to. The session is not one this program \
+                 wrote; start a fresh one rather than resuming it."
+            )
+        })
+    }
+
     /// Return a `serde_json::Value` with `atoma_metadata` stripped, suitable
     /// for sending to the LLM API.
     pub fn to_llm_value(&self) -> Value {

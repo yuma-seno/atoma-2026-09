@@ -22,7 +22,9 @@ use serde_json::Value;
 
 use crate::domain::ports::{FinishReason, LlmChoice, LlmPort, LlmResponse, LlmUsage};
 use crate::domain::session::{Message, ToolCall, ToolCallFunction};
-use crate::infra::llm::shared::{merge_extra_body, report_unread_usage, send_json_with_retry};
+use crate::infra::llm::shared::{
+    merge_extra_body, report_unread_usage, send_json_with_retry, tool_function,
+};
 
 pub struct OpenAIResponsesClient {
     pub(crate) client: reqwest::Client,
@@ -65,7 +67,7 @@ impl LlmPort for OpenAIResponsesClient {
         extra_body: &std::collections::HashMap<String, Value>,
     ) -> Result<LlmResponse> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let body = build_request_body(model, messages, tools, extra_body);
+        let body = build_request_body(model, messages, tools, extra_body)?;
 
         tracing::debug!("Request URL: {}", url);
         tracing::debug!("Request body: {}", serde_json::to_string_pretty(&body)?);
@@ -137,10 +139,10 @@ fn build_request_body(
     messages: &[Message],
     tools: Option<&[Value]>,
     extra_body: &std::collections::HashMap<String, Value>,
-) -> Value {
+) -> Result<Value> {
     let mut body = serde_json::json!({
         "model": model,
-        "input": messages_to_input(messages),
+        "input": messages_to_input(messages)?,
         // Atoma keeps the whole conversation in its own session and resends it,
         // so the server has nothing to remember between calls. Storing it would
         // leave a copy on OpenAI's side that nothing here ever reads.
@@ -148,7 +150,12 @@ fn build_request_body(
     });
 
     if let Some(tools) = tools {
-        body["tools"] = Value::Array(tools.iter().map(chat_tool_to_responses).collect());
+        body["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(chat_tool_to_responses)
+                .collect::<Result<Vec<_>>>()?,
+        );
         body["tool_choice"] = Value::String("auto".to_string());
     }
 
@@ -158,10 +165,10 @@ fn build_request_body(
     // schemas at all — leaving the model to infer argument shapes from the names in
     // the system prompt.
     if let Some(obj) = body.as_object_mut() {
-        merge_extra_body(obj, extra_body);
+        merge_extra_body(obj, extra_body)?;
     }
 
-    body
+    Ok(body)
 }
 
 /// Flatten a Chat Completions tool definition into the Responses shape.
@@ -169,14 +176,14 @@ fn build_request_body(
 /// Chat Completions nests the callable under `function`; Responses puts its
 /// fields at the top level. Everything else about the definition is the same, so
 /// the tool registry produces one shape and this moves it.
-fn chat_tool_to_responses(tool: &Value) -> Value {
-    let func = tool.get("function").unwrap_or(tool);
-    serde_json::json!({
+fn chat_tool_to_responses(tool: &Value) -> Result<Value> {
+    let func = tool_function(tool)?;
+    Ok(serde_json::json!({
         "type": "function",
         "name": func.get("name").cloned().unwrap_or(Value::Null),
         "description": func.get("description").cloned().unwrap_or(Value::Null),
         "parameters": func.get("parameters").cloned().unwrap_or(Value::Null),
-    })
+    }))
 }
 
 /// Turn the session's messages into Responses `input` items.
@@ -188,13 +195,13 @@ fn chat_tool_to_responses(tool: &Value) -> Value {
 /// - each of an assistant's tool calls becomes its own `function_call` item;
 /// - a tool result becomes a `function_call_output`, which is where a picture
 ///   can finally travel as a picture.
-fn messages_to_input(messages: &[Message]) -> Vec<Value> {
+fn messages_to_input(messages: &[Message]) -> Result<Vec<Value>> {
     let mut out = Vec::new();
 
     for msg in messages {
         match msg.role.as_str() {
             "tool" => {
-                let call_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+                let call_id = msg.tool_call_id_for_result()?;
                 out.push(serde_json::json!({
                     "type": "function_call_output",
                     "call_id": call_id,
@@ -232,7 +239,7 @@ fn messages_to_input(messages: &[Message]) -> Vec<Value> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Rewrite MCP content blocks into the input parts a Responses message takes.
@@ -417,7 +424,8 @@ mod tests {
     // smuggled through a later user message; here it is part of the tool result.
     #[test]
     fn a_tool_result_carries_its_picture_as_an_input_image() {
-        let input = messages_to_input(&[tool_message_with_image()]);
+        let input = messages_to_input(&[tool_message_with_image()])
+            .expect("these messages name their calls");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "call_1");
@@ -431,7 +439,8 @@ mod tests {
 
     #[test]
     fn a_text_only_tool_result_stays_a_plain_string() {
-        let input = messages_to_input(&[Message::tool("call_1", "done")]);
+        let input = messages_to_input(&[Message::tool("call_1", "done")])
+            .expect("these messages name their calls");
         assert_eq!(input[0]["output"], "done");
     }
 
@@ -450,7 +459,7 @@ mod tests {
                 },
             }]),
         );
-        let input = messages_to_input(&[msg]);
+        let input = messages_to_input(&[msg]).expect("these messages name their calls");
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["role"], "assistant");
         assert_eq!(input[1]["type"], "function_call");
@@ -460,7 +469,8 @@ mod tests {
 
     #[test]
     fn a_user_message_keeps_its_role_and_content() {
-        let input = messages_to_input(&[Message::user("hello")]);
+        let input =
+            messages_to_input(&[Message::user("hello")]).expect("these messages name their calls");
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"], "hello");
     }
@@ -474,7 +484,7 @@ mod tests {
             {"type": "text", "text": "look at this"},
             {"type": "image", "data": "AAAA", "mimeType": "image/png"},
         ]));
-        let input = messages_to_input(&[msg]);
+        let input = messages_to_input(&[msg]).expect("these messages name their calls");
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][1]["type"], "input_image");
@@ -490,7 +500,7 @@ mod tests {
             "type": "function",
             "function": {"name": "shell", "description": "run", "parameters": {"type": "object"}},
         });
-        let out = chat_tool_to_responses(&tool);
+        let out = chat_tool_to_responses(&tool).expect("this definition has a function wrapper");
         assert_eq!(out["type"], "function");
         assert_eq!(out["name"], "shell");
         assert_eq!(out["description"], "run");
@@ -572,7 +582,7 @@ mod tests {
             )
         };
 
-        let input = messages_to_input(&[message]);
+        let input = messages_to_input(&[message]).expect("these messages name their calls");
         let kinds: Vec<&str> = input
             .iter()
             .map(|item| {
