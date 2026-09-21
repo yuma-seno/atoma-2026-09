@@ -154,6 +154,28 @@ pub enum Command {
         /// usually comes from another machine.
         #[arg(long, value_name = "FILE")]
         stop_file: Option<PathBuf>,
+
+        /// Refuse the run when a tool server's configuration has any finding at all
+        ///
+        /// A finding is what atoma notices when it asks every server what it has: a
+        /// guard pattern matching none of the tools that server advertises, say. Some
+        /// are fatal on their own -- two servers claiming one tool name cannot be
+        /// routed -- and those stop the run whatever this flag says. This is about the
+        /// rest.
+        ///
+        /// Off by default, and deliberately. Stopping the run does not close a guard
+        /// that has stopped guarding; it only removes the ability for an agent to
+        /// repair the configuration, leaving a person to do it by hand. So the default
+        /// is to say so and go on: every finding is written as an
+        /// `ATOMA_CONFIG_FINDING:` line, fatal ones included, which is what lets the
+        /// environment around atoma decide. A caller that would rather stop can say so
+        /// here.
+        ///
+        /// For a pull-request gate, `atoma validate --with-live-tools` is the better
+        /// place: it is already strict, it starts the servers without running an
+        /// agent, and it fails before anything has been changed.
+        #[arg(long)]
+        fail_on_tool_findings: bool,
     },
 
     /// Validate an agent definition and optional tools file

@@ -164,3 +164,9 @@ Validation checks:
 - `extra_body` does not include reserved keys `model` or `messages`.
 - `extra_body.tools`, when present, is an array so it can be merged with the runtime tool definitions. See [agents.md](agents.md).
 - `mcp_servers` entries exist in `tools.yaml` when a tools file is given.
+
+`--with-live-tools` adds one more check that a file alone cannot answer: it starts
+every declared server, asks what it advertises, and fails on anything wrong with the
+configuration — a guard pattern matching nothing, a tool name two servers claim. That
+is the strict check, and the right one for a pull-request gate. See
+[tools-and-skills.md](tools-and-skills.md#what-atoma-finds-wrong-with-a-tools-file).

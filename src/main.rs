@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
             max_iterations,
             max_runtime_secs,
             stop_file,
+            fail_on_tool_findings,
         } => {
             let config = config_module::discover_and_load()?.1;
 
@@ -96,7 +97,10 @@ async fn main() -> Result<()> {
             // whose `env` names it.
             let tool_def_port = infra::persistence::tool_def::FileToolDefAdapter::new(credentials);
             let skill_port = infra::persistence::skill::FileSkillAdapter;
-            let mcp_factory = infra::mcp::McpRegistryFactory;
+            // Straight from the flag, like `stop_file`: what a run does about a
+            // configuration finding belongs to the invocation, not to the agent. See
+            // `Command::Run::fail_on_tool_findings` for why it is off by default.
+            let mcp_factory = infra::mcp::McpRegistryFactory::new(fail_on_tool_findings);
 
             let result = application::runner::run(
                 RunSettings {

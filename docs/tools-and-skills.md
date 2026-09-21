@@ -172,6 +172,62 @@ For a server this project owns, log to `notifications/message`. A message an age
 cannot act on costs it a result it has to read past, so what belongs at `warning`
 is what changed about the answer, not that something happened.
 
+## What atoma finds wrong with a tools file
+
+The section above is what a server says about itself. This one is atoma's own audit
+of your configuration, and it goes to the caller rather than to the agent: an agent
+mid-run cannot fix the file it was started with.
+
+Both `atoma run` and `atoma validate --with-live-tools` start every declared server,
+ask it `tools/list`, and compare the answer with the file. Two things are checked:
+
+| Finding | Severity | What it means |
+| --- | --- | --- |
+| `dead_guard` | `warn` | A pattern in `tool_allowlist` or `tool_denylist` matches none of the tools that server advertises. It reads as a guard and guards nothing — usually a `server__` prefix left in place on a server that sets `unprefixed: true`. |
+| `duplicate_tool` | `error` | Two servers offer one tool name, which routing cannot resolve. The run stops. |
+
+**Only `atoma run` writes this line.** `atoma validate --with-live-tools` prints the
+same findings as prose on stderr and exits non-zero: it is a gate, not a channel.
+
+Each finding is written once, to the log stream on stderr, as a line of fields:
+
+```
+ATOMA_CONFIG_FINDING: kind=dead_guard severity=warn server=files_ro pattern=files_ro__* tools=read,grep,glob
+ATOMA_CONFIG_FINDING: kind=duplicate_tool severity=error tool=read servers=files,files_ro
+```
+
+`kind=dead_guard` carries `server`, `pattern` and `tools` (every tool that server
+advertises, comma-separated, empty when it advertises none). `kind=duplicate_tool`
+carries `tool` and `servers`. Values percent-encode whitespace, `,` and `%`, and are
+otherwise literal — so `a server` with a space in its name arrives as
+`server=a%20server` rather than as two fields.
+
+Three things are worth knowing about this line:
+
+- **The fields are the contract; the English sentence beside them is not.** The prose
+  is written for a person and may be reworded in any release. Anything acting on a
+  finding should read `kind=` and the fields next to it.
+- **An `error` finding emits its line and then stops the run**, before any `--output
+  json` envelope exists. That is the case the line exists for: a fatal finding is
+  precisely the one a caller has no other channel to hear about.
+- **`severity` is atoma's verdict about the configuration, not your policy about it.**
+  `--fail-on-tool-findings` changes what a run does with a `severity=warn` line; it
+  does not change what the line says.
+
+The level follows the severity: `severity=error` is logged at `error` and
+`severity=warn` at `warn`, so a line survives any filter that would still show the
+prose it belongs to. A filter above `error` hides both.
+
+`atoma run --fail-on-tool-findings` refuses to run when there is any finding at all.
+It is off by default, and deliberately: stopping the run does not close a guard that
+has stopped guarding. It only removes the ability for an agent to repair the
+configuration, leaving a person to do it by hand. The default is to say so — in the
+line above, which the environment around atoma can act on — and go on.
+
+For a pull-request gate, `atoma validate --with-live-tools` is the better place. It is
+already strict about both findings, it starts the servers without running an agent,
+and it fails before anything has been changed.
+
 ## Prefixes and reserved namespaces
 
 - External tool names are always prefixed by server name: `server__name`.

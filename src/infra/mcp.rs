@@ -1132,10 +1132,149 @@ fn end_of_event(messages: &mut Vec<Value>, data: &mut String) {
 /// `fatal` is whether a run may proceed past it, and it is the only thing the two
 /// callers disagree about. A guard that guards nothing does not stop a run and does
 /// stop a pull request.
+///
+/// `message` is English for a person and `kind` is the same fact for a program. Both,
+/// because neither does the other's job: an environment that wants to repair a tools
+/// file cannot parse a sentence, and a person reading a log is not helped by
+/// `kind=dead_guard server=files pattern=read`.
 #[derive(Debug, Clone)]
 pub struct Finding {
     pub fatal: bool,
     pub message: String,
+    /// What is wrong and what it is wrong about, with nothing to recover from prose.
+    pub kind: FindingKind,
+}
+
+/// The defects `findings` knows how to report, each carrying what a caller needs to
+/// act on it.
+///
+/// An enum rather than a `kind` string beside a handful of optional fields, because
+/// the fields are not optional: a dead guard always has a pattern, a duplicate always
+/// has the servers that claim it, and a shape that cannot say otherwise is one no
+/// caller has to check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindingKind {
+    /// A pattern in a server's allowlist or denylist that matches none of the tools
+    /// that server advertises.
+    DeadGuard {
+        server: String,
+        pattern: String,
+        /// Every tool the server advertises -- the set the pattern failed to match.
+        /// Whoever repairs the file needs to know what was there to match against;
+        /// the usual cause is a `server__` prefix that the names no longer carry.
+        tools: Vec<String>,
+    },
+    /// One tool name claimed by more than one server, which routing cannot resolve.
+    DuplicateTool {
+        tool: String,
+        /// The servers claiming it, in the order the tools file declares them.
+        servers: Vec<String>,
+    },
+}
+
+/// What every machine-readable configuration line starts with.
+///
+/// A constant because it is the token a caller greps for: it may not drift by a typo
+/// in one `format!` while the documentation says something else.
+pub const CONFIG_FINDING_LINE: &str = "ATOMA_CONFIG_FINDING:";
+
+impl Finding {
+    /// This finding as one line of fields, addressed to the environment running atoma
+    /// rather than to a person.
+    ///
+    /// ```text
+    /// ATOMA_CONFIG_FINDING: kind=dead_guard severity=warn server=files_ro
+    ///                       pattern=read tools=read,grep,glob
+    /// ATOMA_CONFIG_FINDING: kind=duplicate_tool severity=error tool=read
+    ///                       servers=files,files_ro
+    /// ```
+    ///
+    /// (wrapped here to fit; each is one line.)
+    ///
+    /// Same shape as `ATOMA_TOKEN_USAGE` and `ATOMA_INFERENCE_USAGE`: an `ATOMA_`
+    /// name, a colon, then space-separated `key=value`.
+    ///
+    /// **The fields are the contract and the sentence in `message` is not.** A caller
+    /// that greps the English is a caller whose tooling atoma breaks by rewording a
+    /// warning -- so the prose stays free to be good English for a person, and
+    /// anything acting on a finding reads `kind=` and the fields beside it.
+    ///
+    /// `severity` is atoma's own verdict about the configuration -- a dead guard is
+    /// `warn`, a name two servers claim is `error` -- and not the caller's policy
+    /// about it. `--fail-on-tool-findings` changes what a run does with a
+    /// `severity=warn` line; it does not change what the line says, because the
+    /// caller that set the flag is the one caller that already knows it did.
+    ///
+    /// Values are percent-encoded for whitespace, `,` and `%`, and written literally
+    /// otherwise. Server names and glob patterns come out of the caller's tools file,
+    /// so a space in one is possible in principle, and one space would turn a value
+    /// into two fields for every reader at once. `,` is encoded because it separates
+    /// the entries of a list, and `%` because encoding anything at all makes it the
+    /// escape character. Ordinary names and globs contain none of the three and
+    /// survive byte for byte.
+    pub fn machine_line(&self) -> String {
+        let severity = if self.fatal { "error" } else { "warn" };
+        match &self.kind {
+            FindingKind::DeadGuard {
+                server,
+                pattern,
+                tools,
+            } => format!(
+                "{} kind=dead_guard severity={} server={} pattern={} tools={}",
+                CONFIG_FINDING_LINE,
+                severity,
+                field(server),
+                field(pattern),
+                field_list(tools),
+            ),
+            FindingKind::DuplicateTool { tool, servers } => format!(
+                "{} kind=duplicate_tool severity={} tool={} servers={}",
+                CONFIG_FINDING_LINE,
+                severity,
+                field(tool),
+                field_list(servers),
+            ),
+        }
+    }
+}
+
+/// One value, with the three characters that would break the line's own grammar
+/// percent-encoded as their UTF-8 bytes.
+///
+/// Whitespace would split one field into two, a comma would split one list entry into
+/// two, and `%` has to be encoded for either of those to be reversible. Everything
+/// else is written as it is, including the `_` and `*` that real names and globs are
+/// made of: encoding those would make the common case unreadable to buy nothing.
+fn field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            ',' => out.push_str("%2C"),
+            c if c.is_whitespace() => {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).as_bytes() {
+                    out.push_str(&format!("%{:02X}", byte));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Several values as one comma-separated field. Empty is written as nothing, which is
+/// a server that advertises no tools at all -- the state in which every pattern it
+/// declares is dead.
+fn field_list(values: &[String]) -> String {
+    let mut out = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&field(value));
+    }
+    out
 }
 
 /// What these servers, having said what they have, are wrong about.
@@ -1163,6 +1302,11 @@ pub fn findings(configs: &[ToolDef], offered: &[(String, Vec<RegisteredTool>)]) 
                     pattern,
                     names.join(", "),
                 ),
+                kind: FindingKind::DeadGuard {
+                    server: config.name.clone(),
+                    pattern: pattern.clone(),
+                    tools: names.clone(),
+                },
             });
         }
 
@@ -1182,6 +1326,10 @@ pub fn findings(configs: &[ToolDef], offered: &[(String, Vec<RegisteredTool>)]) 
                          deny the tool on one.",
                         tool.prefixed_name, first, config.name,
                     ),
+                    kind: FindingKind::DuplicateTool {
+                        tool: tool.prefixed_name.clone(),
+                        servers: vec![first.clone(), config.name.clone()],
+                    },
                 });
                 continue;
             }
@@ -1215,6 +1363,89 @@ pub async fn inspect(configs: &[ToolDef]) -> Result<Vec<Finding>> {
     Ok(findings(configs, &offered))
 }
 
+/// What a set of findings makes a run say, and then do.
+///
+/// The fields are in the order they happen, and that order is the whole point: every
+/// machine-readable line is written before anything reads `refusal`. A fatal finding
+/// ends the run before any JSON result envelope exists, so its
+/// `ATOMA_CONFIG_FINDING` line is the ONLY channel the caller has -- emitting it after
+/// the refusal would mean the worst finding is the one nothing outside the log ever
+/// hears about.
+struct FindingReport {
+    /// One `ATOMA_CONFIG_FINDING` line per finding, fatal ones included, each paired
+    /// with whether that finding is fatal.
+    ///
+    /// Paired rather than left parallel to the findings themselves, because the pairing
+    /// is what decides the log level, and a level taken from the wrong element is a
+    /// line that disappears at exactly the severity it was written for.
+    lines: Vec<(bool, String)>,
+    /// The prose a person reads, which stops at the first fatal finding exactly as it
+    /// did when one loop did both jobs: `findings` sorts fatal first, so a run that is
+    /// about to be refused does not also list what it would have tolerated.
+    warnings: Vec<String>,
+    /// What to fail with, or `None` to go on.
+    refusal: Option<String>,
+}
+
+impl FindingReport {
+    /// Write all of it, in the order that matters, and hand back what to fail with.
+    ///
+    /// The level follows the finding. Every line was `info` at first, which inverted
+    /// the intent: under `RUST_LOG=warn` -- ordinary in CI -- the prose still reached
+    /// stderr through the refusal, while the machine-readable line, the one channel a
+    /// fatal finding has before any result envelope exists, was filtered away.
+    fn emit(self) -> Option<String> {
+        for (fatal, line) in &self.lines {
+            if *fatal {
+                tracing::error!("{}", line);
+            } else {
+                tracing::warn!("{}", line);
+            }
+        }
+        for message in &self.warnings {
+            tracing::warn!("{}", message);
+        }
+        self.refusal
+    }
+}
+
+/// Decide the above, apart from doing any of it.
+///
+/// Separated from `from_configs` because the order is the contract and `from_configs`
+/// needs a started server for every entry in a tools file, so nothing there is
+/// reachable from a unit test. Here the whole decision is a function of the findings.
+fn report_on(found: &[Finding], fail_on_findings: bool) -> FindingReport {
+    let mut report = FindingReport {
+        lines: found
+            .iter()
+            .map(|finding| (finding.fatal, finding.machine_line()))
+            .collect(),
+        warnings: Vec::new(),
+        refusal: None,
+    };
+
+    for finding in found {
+        if finding.fatal {
+            report.refusal = Some(finding.message.clone());
+            return report;
+        }
+        report.warnings.push(finding.message.clone());
+    }
+
+    // Nothing above this line is a run-stopper, so this is the only thing the flag
+    // decides. See `Command::Run::fail_on_tool_findings` for why the default is off.
+    if fail_on_findings && !found.is_empty() {
+        report.refusal = Some(format!(
+            "{} tool configuration finding(s), and --fail-on-tool-findings asks for a \
+             run to stop on them: {}",
+            found.len(),
+            report.warnings.join(" "),
+        ));
+    }
+
+    report
+}
+
 /// Manages multiple MCP connections and routes tool calls by tool prefix.
 pub struct McpRegistry {
     connections: HashMap<String, McpConnection>,
@@ -1225,7 +1456,14 @@ pub struct McpRegistry {
 }
 
 impl McpRegistry {
-    pub async fn from_configs(configs: &[ToolDef]) -> Result<Self> {
+    /// Start every declared server and build the registry.
+    ///
+    /// `fail_on_findings` is the caller's answer to a configuration defect that does
+    /// not by itself stop a run -- `--fail-on-tool-findings`. `false` is what every
+    /// caller got before the flag existed: warn, emit the machine-readable line, and
+    /// run. Whatever it is, every finding's line is written before anything is
+    /// refused.
+    pub async fn from_configs(configs: &[ToolDef], fail_on_findings: bool) -> Result<Self> {
         let mut seen = std::collections::HashSet::new();
         for config in configs {
             if !seen.insert(&config.name) {
@@ -1248,11 +1486,11 @@ impl McpRegistry {
             offered.push((config.name.clone(), tools));
         }
 
-        for finding in findings(configs, &offered) {
-            if finding.fatal {
-                anyhow::bail!("{}", finding.message);
-            }
-            tracing::warn!("{}", finding.message);
+        // The lines first, then the prose, then the decision. `FindingReport::emit`
+        // owns that order; `report_on` says what `fail_on_findings` changes about it.
+        let report = report_on(&findings(configs, &offered), fail_on_findings);
+        if let Some(message) = report.emit() {
+            anyhow::bail!("{}", message);
         }
 
         let mut all_tools = Vec::new();
@@ -1440,7 +1678,25 @@ impl crate::domain::ports::ToolPort for McpRegistry {
 // ── MCP factory ───────────────────────────────────────────────────────────────
 
 /// Factory adapter implementing `McpFactory` for constructing `McpRegistry`.
-pub struct McpRegistryFactory;
+pub struct McpRegistryFactory {
+    /// Whether a finding that only warns should stop the run -- the
+    /// `--fail-on-tool-findings` flag, carried here rather than through `McpFactory`.
+    ///
+    /// The port's `build` takes the tool definitions and nothing else, and that
+    /// signature is implemented by every test double in the suite. This is a policy
+    /// the adapter holds, not a second thing every caller of the port has to answer.
+    fail_on_findings: bool,
+}
+
+impl McpRegistryFactory {
+    /// Off is the default and is what `Default` would have given, but there is no
+    /// `Default` here: the one caller that builds this is the one that read the flag,
+    /// and a factory built without saying which policy it carries is a factory whose
+    /// policy nobody stated.
+    pub fn new(fail_on_findings: bool) -> Self {
+        Self { fail_on_findings }
+    }
+}
 
 #[async_trait::async_trait]
 impl crate::domain::ports::McpFactory for McpRegistryFactory {
@@ -1448,7 +1704,7 @@ impl crate::domain::ports::McpFactory for McpRegistryFactory {
         &self,
         tool_defs: &[crate::domain::tool::ToolDef],
     ) -> anyhow::Result<Box<dyn crate::domain::ports::ToolPort + Send>> {
-        let registry = McpRegistry::from_configs(tool_defs).await?;
+        let registry = McpRegistry::from_configs(tool_defs, self.fail_on_findings).await?;
         Ok(Box::new(registry))
     }
 }
@@ -1746,5 +2002,193 @@ mod http_body_tests {
         let messages = sse_messages(body);
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert_eq!(messages[0]["id"], json!(2));
+    }
+}
+
+#[cfg(test)]
+mod finding_line_tests {
+    use super::{field, findings, report_on, Finding, FindingKind, RegisteredTool};
+    use crate::domain::tool::{Hooks, ToolDef};
+    use std::collections::HashMap;
+
+    /// `unprefixed`, because that is the arrangement both defects live in: the tools
+    /// keep their own names, so a `server__` pattern guards nothing and two servers
+    /// can claim one name.
+    fn server(name: &str, allow: &[&str], deny: &[&str]) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            command: "/bin/true".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            hooks: Hooks {
+                tool_allowlist: allow.iter().map(|s| s.to_string()).collect(),
+                tool_denylist: deny.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            unprefixed: true,
+            max_output_chars: None,
+            request_timeout_secs: None,
+        }
+    }
+
+    fn advertised(names: &[&str]) -> Vec<RegisteredTool> {
+        names
+            .iter()
+            .map(|name| RegisteredTool {
+                prefixed_name: name.to_string(),
+                tool_name: name.to_string(),
+                schema: serde_json::json!({}),
+            })
+            .collect()
+    }
+
+    fn dead_guard() -> Finding {
+        Finding {
+            fatal: false,
+            message: "a pattern that is guarding nothing".to_string(),
+            kind: FindingKind::DeadGuard {
+                server: "files_ro".to_string(),
+                pattern: "files_ro__*".to_string(),
+                tools: vec!["read".to_string(), "grep".to_string()],
+            },
+        }
+    }
+
+    fn duplicate_tool() -> Finding {
+        Finding {
+            fatal: true,
+            message: "two servers offer a tool named 'read'".to_string(),
+            kind: FindingKind::DuplicateTool {
+                tool: "read".to_string(),
+                servers: vec!["files".to_string(), "files_ro".to_string()],
+            },
+        }
+    }
+
+    /// Pinned whole, deliberately. This line is a contract with whatever is running
+    /// atoma, and a contract asserted field by field is one a refactor can reword a
+    /// piece of without a test saying so.
+    #[test]
+    fn a_dead_guard_line_names_the_server_the_pattern_and_every_tool() {
+        let configs = [server("files_ro", &[], &["files_ro__*"])];
+        let offered = [("files_ro".to_string(), advertised(&["read", "grep"]))];
+        let found = findings(&configs, &offered);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].machine_line(),
+            "ATOMA_CONFIG_FINDING: kind=dead_guard severity=warn server=files_ro \
+             pattern=files_ro__* tools=read,grep",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_tool_line_names_the_tool_and_both_servers() {
+        let configs = [server("files", &[], &[]), server("files_ro", &[], &[])];
+        let offered = [
+            ("files".to_string(), advertised(&["read"])),
+            ("files_ro".to_string(), advertised(&["read"])),
+        ];
+        let found = findings(&configs, &offered);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].machine_line(),
+            "ATOMA_CONFIG_FINDING: kind=duplicate_tool severity=error tool=read \
+             servers=files,files_ro",
+        );
+    }
+
+    /// The case the line exists for. A fatal finding ends the run before any result
+    /// envelope is written, so a line emitted after the refusal would not be emitted
+    /// at all -- and the worst defect would be the one only a log could tell anyone
+    /// about.
+    #[test]
+    fn a_fatal_finding_emits_its_line_before_the_run_is_refused() {
+        let report = report_on(&[duplicate_tool()], false);
+        assert_eq!(report.lines.len(), 1, "{:?}", report.lines);
+        assert!(
+            report.lines[0].1.contains("kind=duplicate_tool severity=error"),
+            "{:?}",
+            report.lines,
+        );
+        assert!(report.refusal.is_some(), "a duplicate name is still fatal");
+    }
+
+    /// Off is what every caller had before the flag existed, and on changes what the
+    /// run does rather than what it says.
+    #[test]
+    fn a_warning_stops_a_run_only_when_the_caller_asks_it_to() {
+        let found = [dead_guard()];
+        let tolerated = report_on(&found, false);
+        let refused = report_on(&found, true);
+        assert!(tolerated.refusal.is_none(), "{:?}", tolerated.refusal);
+        assert!(refused.refusal.is_some());
+        assert_eq!(
+            tolerated.warnings, refused.warnings,
+            "the prose a person reads is the same either way",
+        );
+        assert_eq!(
+            tolerated.lines, refused.lines,
+            "the flag is the caller's policy, not a different finding",
+        );
+        assert!(
+            refused.lines[0].1.contains("severity=warn"),
+            "severity is atoma's verdict and not the caller's: {:?}",
+            refused.lines,
+        );
+    }
+
+    /// A run with nothing wrong is not refused even by a caller that asked to be
+    /// strict, so the flag cannot turn a clean configuration into a failure.
+    #[test]
+    fn no_findings_is_no_lines_and_no_refusal() {
+        let report = report_on(&[], true);
+        assert!(report.lines.is_empty());
+        assert!(report.warnings.is_empty());
+        assert!(report.refusal.is_none());
+    }
+
+    /// Server names and glob patterns come out of the caller's file, and one space in
+    /// one of them would turn a value into two fields for every reader at once.
+    #[test]
+    fn a_value_with_a_space_in_it_cannot_become_two_fields() {
+        let finding = Finding {
+            fatal: false,
+            message: "a server whose name has a space in it".to_string(),
+            kind: FindingKind::DeadGuard {
+                server: "my files".to_string(),
+                pattern: "read *".to_string(),
+                tools: vec!["read".to_string()],
+            },
+        };
+        let line = finding.machine_line();
+        assert_eq!(
+            line.split_whitespace().count(),
+            6,
+            "the name and one token per field: {line}",
+        );
+        assert!(line.contains("server=my%20files"), "{line}");
+        assert!(line.contains("pattern=read%20*"), "{line}");
+    }
+
+    /// `%` is encoded because encoding anything at all makes it the escape character,
+    /// and `,` because it is what separates the entries of a list.
+    #[test]
+    fn the_escape_character_and_the_list_separator_are_themselves_encoded() {
+        assert_eq!(field("100%"), "100%25");
+        assert_eq!(field("a,b"), "a%2Cb");
+        assert_eq!(field("read_text_file"), "read_text_file");
+    }
+
+    /// A server that advertises nothing is the state in which every pattern it
+    /// declares is dead, so the empty list is a value a reader will meet.
+    #[test]
+    fn a_server_that_advertises_no_tools_writes_an_empty_list() {
+        let configs = [server("silent", &[], &["silent__*"])];
+        let offered = [("silent".to_string(), advertised(&[]))];
+        let found = findings(&configs, &offered);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].machine_line().ends_with(" tools="), "{found:?}");
     }
 }
