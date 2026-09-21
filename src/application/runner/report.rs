@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use crate::domain::ports::LlmUsage;
 
-use super::execution::CompletionReason;
+use super::CompletionReason;
 
 /// Observable outcome of a run that reached an ending of its own. Presentation belongs
 /// to the caller.
