@@ -106,6 +106,34 @@ pub fn severity_of_stderr(line: &str) -> Severity {
     Severity::Routine
 }
 
+/// The severity to record for a line a server wrote to a log channel.
+///
+/// `guess_from_words` is the whole of the difference, and it is off unless that
+/// server's own entry in the tools file asked for it. The word list above was
+/// calibrated on the output of servers somebody here had read; atoma ships no MCP
+/// server at all, so a run that only wires up somebody else's inherits the
+/// calibration without the servers it was calibrated on.
+///
+/// The measured case: `npx -y @modelcontextprotocol/server-filesystem` prints npm's
+/// deprecation notice to stderr before the server starts, so that run's first tool
+/// result carried "1 problem reported by the 'filesystem' server" describing npm --
+/// and the person who connected the server had nothing to turn off. A build tool
+/// that ends with "0 errors" is the same mistake pointed the other way.
+///
+/// Off means routine, not silent. The line is still logged where every other line
+/// from that server is logged; what stops is a guess being attached to a tool result
+/// as though the server had reported it.
+///
+/// `notifications/message` does not come through here. There the level is a field the
+/// server filled in, nothing is inferred, and that is why that channel stays on by
+/// default while this one has to be asked for.
+pub fn severity_of_output(line: &str, guess_from_words: bool) -> Severity {
+    if !guess_from_words {
+        return Severity::Routine;
+    }
+    severity_of_stderr(line)
+}
+
 /// Whether `needle` appears in `haystack` bounded by non-alphanumerics.
 ///
 /// `haystack` is expected lowercase already; this does not lowercase again.
@@ -323,6 +351,31 @@ mod tests {
         );
         assert_eq!(severity_of_stderr("warning"), Severity::Warning);
         assert_eq!(severity_of_stderr("[WARN] x"), Severity::Warning);
+    }
+
+    /// The line that made this opt-in. npm prints it before the server it is about
+    /// to start has said anything, and it was reaching the model as a problem the
+    /// `filesystem` server had reported about itself.
+    #[test]
+    fn the_guess_is_not_made_unless_it_was_asked_for() {
+        let line = "npm warn deprecated glob@7.2.3: this package is no longer supported";
+        assert_eq!(severity_of_output(line, false), Severity::Routine);
+        assert_eq!(severity_of_output(line, true), Severity::Warning);
+    }
+
+    /// Asking for it gets the existing word list unchanged -- the flag gates the
+    /// reading, it does not narrow it. A server whose operator calibrated the words
+    /// against their own output is exactly who this is for.
+    #[test]
+    fn asking_for_the_guess_gets_the_whole_of_it() {
+        assert_eq!(
+            severity_of_output("fatal: not a git repository", true),
+            Severity::Error
+        );
+        assert_eq!(
+            severity_of_output("running on stdio", true),
+            Severity::Routine
+        );
     }
 
     #[test]

@@ -112,6 +112,29 @@ pub struct ToolDef {
     /// run says so. Which is why it is opt-in per server rather than a bigger
     /// default, and why a server that answers quickly should not set it.
     pub request_timeout_secs: Option<u64>,
+    /// Whether a line this server writes to its log channel may be given a severity
+    /// guessed from the words in it.
+    ///
+    /// Off by default, and that is the point. `domain::tool_health` reads `error`,
+    /// `fatal`, `panic`, `warn` and their plurals out of a line and attaches what it
+    /// finds to the server's next tool result. The word list was calibrated on the
+    /// output of servers whoever wrote it had read -- but atoma ships no MCP server,
+    /// so every server is somebody else's, and a caller who only wires one up cannot
+    /// correct a misreading of output they do not control.
+    ///
+    /// The measured case: `npx -y @modelcontextprotocol/server-filesystem` prints
+    /// npm's deprecation notice before the server starts, and the run's first tool
+    /// result said the `filesystem` server had reported a problem. It had not; npm
+    /// had. A build tool ending with "0 errors" fails the same way.
+    ///
+    /// So the guess is per server, set by whoever knows that server's output -- the
+    /// same layer as `request_timeout_secs` and `max_output_chars`. Off does not mean
+    /// silent: the line is still logged, it just stops being presented to the model
+    /// as the server's own report.
+    ///
+    /// `notifications/message` is unaffected. There the severity is a field the server
+    /// filled in, which is a report rather than a guess, and it stays on by default.
+    pub guess_severity_from_output: bool,
 }
 
 /// What to say when `mcp_servers` names a server the tools file has not got.

@@ -40,6 +40,14 @@ struct ToolConfig {
     /// client's default.
     #[serde(default)]
     pub max_output_chars: Option<usize>,
+    /// Let a severity be guessed from the words in this server's output.
+    ///
+    /// Absent means no, which is the only defensible default for a word list
+    /// calibrated on servers the caller may not be running. See
+    /// `domain::tool::ToolDef` for the npm deprecation notice that got attached to a
+    /// tool result as a problem the `filesystem` server had reported.
+    #[serde(default)]
+    pub guess_severity_from_output: bool,
 }
 
 /// The whole tools file: one reserved key, and a server under every other.
@@ -314,6 +322,9 @@ pub fn load(path: &Path, credentials: &Credentials) -> Result<HashMap<String, To
                 // Zero means the default here too. One rule about zero across the
                 // whole crate is worth more than a cleverer rule in one place.
                 max_output_chars: cfg.max_output_chars.filter(|chars| *chars > 0),
+                // Straight through: a bool has no zero to reinterpret, and the
+                // absent case is already false by `#[serde(default)]`.
+                guess_severity_from_output: cfg.guess_severity_from_output,
             };
             Ok((name, def))
         })
@@ -446,6 +457,23 @@ mod tests {
     fn zero_means_the_default_the_same_as_absent() {
         let tools = load_yaml("web:\n  command: bun\n  args: []\n  request_timeout_secs: 0\n");
         assert_eq!(tools["web"].request_timeout_secs, None);
+    }
+
+    /// Off unless asked for, which is the whole of the change. A tools file written
+    /// for an older atoma says nothing about this key, and a caller wiring up
+    /// somebody else's server gets no guesses made about its output.
+    #[test]
+    fn a_server_that_says_nothing_gets_no_severity_guess() {
+        let tools = load_yaml("shell:\n  command: bun\n  args: []\n");
+        assert!(!tools["shell"].guess_severity_from_output);
+    }
+
+    /// And asking for it works, because the people who can defend the guess are the
+    /// ones who have read the server's output -- the same ones who set its timeout.
+    #[test]
+    fn a_server_can_ask_for_the_severity_guess() {
+        let tools = load_yaml("shell:\n  command: bun\n  guess_severity_from_output: true\n");
+        assert!(tools["shell"].guess_severity_from_output);
     }
 
     fn load_err(body: &str) -> String {

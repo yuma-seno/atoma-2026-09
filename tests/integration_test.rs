@@ -97,6 +97,7 @@ impl SingleEntryToolDefPort {
                 max_output_chars: None,
                 hooks: atoma::domain::tool::Hooks::default(),
                 request_timeout_secs: None,
+                guess_severity_from_output: false,
             },
         }
     }

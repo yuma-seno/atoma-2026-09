@@ -304,6 +304,7 @@ impl McpConnection {
                         "stderr",
                         handle,
                         Arc::clone(&conn.health),
+                        config.guess_severity_from_output,
                     );
                 }
                 if let Some(handle) = logged_stdout {
@@ -312,6 +313,7 @@ impl McpConnection {
                         "stdout",
                         handle,
                         Arc::clone(&conn.health),
+                        config.guess_severity_from_output,
                     );
                 }
 
@@ -822,10 +824,19 @@ where
 /// stdout as well for a server spoken to over HTTP. Both are ordinary logging there,
 /// and the reason to read stdout at all is that an unread pipe stalls the writer at
 /// 64KB.
-fn watch_log<R>(server: String, channel: &'static str, handle: R, health: Arc<Mutex<HealthLog>>)
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
+///
+/// `guess_severity` is that server's `guess_severity_from_output`, carried in rather
+/// than read here, because whether a line's words may be turned into a severity is a
+/// property of the server -- and this function is handed a pipe, not a config. The
+/// bound moved onto `R` inline when the parameter list went vertical; it is the same
+/// bound.
+fn watch_log<R: AsyncRead + Unpin + Send + 'static>(
+    server: String,
+    channel: &'static str,
+    handle: R,
+    health: Arc<Mutex<HealthLog>>,
+    guess_severity: bool,
+) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(handle);
         let mut line = String::new();
@@ -839,8 +850,12 @@ where
                     // The fallback channel of `domain::tool_health`, and today the
                     // only one in use: no server this project ships implements
                     // `logging` yet. Severity has to be read out of the words, which
-                    // is what makes this the fallback rather than the primary.
-                    let severity = tool_health::severity_of_stderr(text);
+                    // is what makes this the fallback rather than the primary -- and
+                    // why the reading only happens for a server that asked for it.
+                    // The `tracing::info!` above is deliberately unconditional: a
+                    // server whose output is not being read for severity still has
+                    // every line in the run log, so nothing is lost, only the guess.
+                    let severity = tool_health::severity_of_output(text, guess_severity);
                     if severity != Severity::Routine {
                         if let Ok(mut log) = health.lock() {
                             log.record(severity, text);
@@ -2030,6 +2045,7 @@ mod finding_line_tests {
             unprefixed: true,
             max_output_chars: None,
             request_timeout_secs: None,
+            guess_severity_from_output: false,
         }
     }
 

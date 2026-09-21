@@ -161,10 +161,29 @@ Two channels feed it, whatever transport the server speaks:
   from the notification's `level`. This is the one to implement: it works over any
   transport and the server says how bad the thing is.
 - **the server's own output**, for a server that implements no logging capability --
-  which today is every third-party one. Severity is read out of the words
-  (`error`, `errors`, `fatal`, `panic`, `warn`, `warning`, `warnings`), so it is a
-  guess: a line that happens to contain "warning" is surfaced, and one reporting
-  trouble without any of those words is missed.
+  which today is every third-party one. **Off unless that server asks for it**,
+  with `guess_severity_from_output`:
+
+  ```yaml
+  search:
+    command: bun
+    args: ["run", "./scripts/search.ts"]
+    guess_severity_from_output: true
+  ```
+
+  Because there is no severity field here, one has to be read out of the words
+  (`error`, `errors`, `fatal`, `panic`, `warn`, `warning`, `warnings`) — a guess,
+  and one calibrated on servers whoever wrote the list had read. Atoma ships no MCP
+  server, so that calibration does not travel. `npx -y
+  @modelcontextprotocol/server-filesystem` prints npm's deprecation notice before
+  the server starts, and every first tool result carried "1 problem reported by the
+  'filesystem' server" describing npm; a build tool that ends with "0 errors" is the
+  same mistake pointed the other way. Whoever connected the server could not correct
+  either, because the output is not theirs. So it is per server, set by someone who
+  has read that server's output — the same people who set its timeout.
+
+  Off is not silent. Every line still goes to the run log, exactly as before; what
+  stops is the guess being attached to a tool result as the server's own report.
 
   This channel only exists for a server atoma started. Over stdio that means
   stderr, because stdout is the transport; over HTTP it means stderr **and**
