@@ -196,6 +196,7 @@ async fn test_single_text_response() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 
@@ -254,6 +255,7 @@ async fn test_tool_call_then_text_response() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 
@@ -317,6 +319,7 @@ async fn test_skill_load_is_persisted_as_tool_history() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await
     .unwrap();
@@ -398,6 +401,7 @@ async fn test_max_iterations_exceeded() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 
@@ -466,6 +470,7 @@ async fn test_max_runtime_exceeded() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 
@@ -549,6 +554,7 @@ async fn test_a_failed_run_saves_a_resumable_session() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await
     .unwrap_err();
@@ -627,6 +633,7 @@ async fn test_stop_file_ends_the_run() {
     let stop_path = dir.path().join("stop");
     std::fs::write(&stop_path, "").unwrap();
 
+    let mut facts = atoma::application::runner::RunFacts::default();
     let result = run(
         RunSettings {
             agent_def_path: agent_path,
@@ -649,6 +656,7 @@ async fn test_stop_file_ends_the_run() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut facts,
     )
     .await;
 
@@ -663,6 +671,14 @@ async fn test_stop_file_ends_the_run() {
         "Expected a stop-requested error, got: {}",
         err
     );
+    // The facts survive the `Err`, which is the whole reason they are an out parameter:
+    // this run produced no outcome to attach them to, and its caller still has to say
+    // on stdout which of the three ceilings ended it. Exit status 2 cannot, and clap
+    // uses 2 as well.
+    assert_eq!(facts.ended_because, "stopped");
+    let reported = atoma::application::runner::envelope(&facts, None);
+    assert_eq!(reported["ended_because"], "stopped");
+    assert_eq!(reported["response"], serde_json::Value::Null);
 }
 
 /// A stop file that is absent changes nothing.
@@ -707,6 +723,7 @@ async fn test_an_absent_stop_file_does_not_stop_the_run() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 
@@ -777,6 +794,7 @@ async fn test_identical_failed_tool_calls_abort() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await
     .unwrap_err();
@@ -827,6 +845,7 @@ async fn test_empty_completion_is_retried_then_succeeds() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 
@@ -875,6 +894,7 @@ async fn test_repeated_empty_completions_abort() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await
     .unwrap_err();
@@ -946,6 +966,7 @@ async fn test_content_filter_returns_error() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 
@@ -1014,6 +1035,7 @@ async fn test_truncated_response_reports_length_reason() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await
     .unwrap();
@@ -1103,6 +1125,7 @@ async fn test_prompt_file_is_appended_and_persisted() {
             template: &atoma::infra::template::FileTemplateAdapter,
             mcp_factory: &mcp_factory,
         },
+        &mut atoma::application::runner::RunFacts::default(),
     )
     .await;
 

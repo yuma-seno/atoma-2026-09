@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::application::runner::{CompletionReason, RunDeps, RunOutcome, RunSettings};
+use crate::application::runner::{envelope, RunDeps, RunFacts, RunOutcome, RunSettings};
 use crate::cli::{Cli, Command};
 use crate::domain::ports::AgentDefPort;
 use crate::infra::config::{self as config_module, CliOverrides, OutputFormat};
@@ -109,6 +109,9 @@ async fn main() -> Result<()> {
             // `Command::Run::fail_on_tool_findings` for why it is off by default.
             let mcp_factory = infra::mcp::McpRegistryFactory::new(fail_on_tool_findings);
 
+            // Filled in by the run, on whichever path it takes. See `RunFacts`.
+            let mut facts = RunFacts::default();
+
             let result = application::runner::run(
                 RunSettings {
                     agent_def_path: resolved.agent_def,
@@ -134,44 +137,32 @@ async fn main() -> Result<()> {
                     skill: &skill_port,
                     mcp_factory: &mcp_factory,
                 },
+                &mut facts,
             )
             .await;
 
             let outcome = match result {
                 Ok(outcome) => outcome,
+                // Both of these used to print nothing to stdout whatever `--output`
+                // said. A caller learned that a run had been stopped from exit status
+                // 2, which all three ceilings share with clap's own parse error, and
+                // learned which ceiling it was by opening the session file -- if it had
+                // asked for one. The envelope answers it on stdout, where the caller
+                // was already reading.
                 Err(err) if application::runner::is_soft_stop(&err) => {
+                    emit_run_envelope(&output_format, &facts, None)?;
                     std::process::exit(2);
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    // Before the error goes back up: the message it carries goes to
+                    // stderr, and what the run spent before dying goes here.
+                    emit_run_envelope(&output_format, &facts, None)?;
+                    return Err(err);
+                }
             };
 
-            if let RunOutcome::Completed {
-                text,
-                usage,
-                reason,
-                session_path,
-            } = outcome
-            {
-                match output_format {
-                    OutputFormat::Text => println!("{}", text),
-                    OutputFormat::Json => {
-                        let output = serde_json::json!({
-                            "response": text,
-                            "usage": {
-                                "prompt_tokens": usage.prompt_tokens,
-                                "completion_tokens": usage.completion_tokens,
-                                "total_tokens": usage.total_tokens,
-                            },
-                            "finish_reason": match reason {
-                                CompletionReason::Stop => "stop",
-                                CompletionReason::Length => "length",
-                            },
-                            "session_path": session_path.map(|p| p.to_string_lossy().to_string()),
-                        });
-                        println!("{}", serde_json::to_string(&output)?);
-                    }
-                }
-            }
+            emit_run_text(&output_format, &outcome);
+            emit_run_envelope(&output_format, &facts, Some(&outcome))?;
 
             Ok(())
         }
@@ -241,4 +232,41 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Print what `--output text` prints: the agent's answer, and nothing else.
+///
+/// Unchanged behaviour, moved into a function beside its JSON counterpart so the two
+/// modes are visibly one decision. A run a tool ended has no answer and printed nothing
+/// here before; it still prints nothing here, and now says what it spent in the envelope
+/// instead of nowhere.
+fn emit_run_text(format: &OutputFormat, outcome: &RunOutcome) {
+    let RunOutcome::Completed { text, .. } = outcome else {
+        return;
+    };
+    if matches!(format, OutputFormat::Text) {
+        println!("{}", text);
+    }
+}
+
+/// Print the run's machine-readable envelope, if the caller asked for one.
+///
+/// Called on every exit path a run has -- a completion, a session a tool ended, the
+/// three soft stops and every failure -- which is the whole point: a caller that parses
+/// stdout should not have to know in advance which of those happened to get an answer,
+/// and until now only the completion printed anything there at all.
+///
+/// The `--output text` decision is made here rather than at the three call sites so that
+/// a path added later cannot forget it, and so text output stays exactly what it was: a
+/// caller that did not ask for JSON sees the agent's answer and nothing else.
+fn emit_run_envelope(
+    format: &OutputFormat,
+    facts: &RunFacts,
+    outcome: Option<&RunOutcome>,
+) -> Result<()> {
+    if !matches!(format, OutputFormat::Json) {
+        return Ok(());
+    }
+    println!("{}", serde_json::to_string(&envelope(facts, outcome))?);
+    Ok(())
 }

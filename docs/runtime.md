@@ -64,6 +64,10 @@ conversation is whole and every tool call has its result, saves the session, ret
 the corresponding error, and the CLI exits with status 2. The session is resumable
 with `--in-session`.
 
+All three share that status, so it cannot say which of them happened. Which one it was
+is in `ended_because`, in the `--output json` envelope and in the session's `atoma_runs`
+— see [Output modes and exit behavior](#output-modes-and-exit-behavior).
+
 `--max-runtime-secs` is the one to reach for under a CI job with its own timeout. Set
 it below that timeout: a run that is killed by the job never reaches the step that
 saves the session, so its work is gone rather than resumable.
@@ -91,6 +95,9 @@ In this path:
 - session can still be saved
 - no assistant text response is printed
 - process exits successfully
+- with `--output json`, the envelope is printed like any other ending, with `response`
+  and `finish_reason` as `null` and `ended_because` as `completed` — this is how a run
+  that finished by opening a pull request ends, and it is a success
 
 ## Session semantics
 
@@ -119,20 +126,53 @@ Prompt source behavior:
 
 `--output text` (default):
 
-- prints final assistant text
+- prints the final assistant text, and nothing else
+- prints nothing at all when a tool ended the session, when a ceiling or a stop file
+  ended the run, or when the run failed
 
-`--output json`:
+`--output json` prints one envelope on stdout on **every** exit path: a completion, a
+session a tool ended, each of the three deliberate stops, and a failure. The key set is
+the same on all of them, so a caller does not have to know which happened before it can
+read an answer.
 
-- prints JSON with `response`, `usage`, `finish_reason`, `session_path`
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `response` | string \| null | Final assistant text. `null` on every ending that has none — a session a tool ended, a deliberate stop, a failure. |
+| `finish_reason` | `stop` \| `length` \| null | Why the model stopped. `null` wherever `response` is. |
+| `usage.prompt_tokens` | number | Summed over the inferences this run made. Partial on a run that did not finish, which is what that run actually spent. |
+| `usage.completion_tokens` | number | As above. |
+| `usage.total_tokens` | number | As above. |
+| `usage.cached_prompt_tokens` | number \| null | How much of the prompt the provider served from its cache. `null` means no inference reported one, which is not the same as zero and must not be read as a cache that did nothing. |
+| `usage.written_prompt_tokens` | number \| null | How much of the prompt the provider wrote into its cache. `null` on the same terms. |
+| `session_path` | string \| null | Where the session was written, when `--in-session` or `--out-session` asked for one. |
+| `ended_because` | string | Why the run ended: one of the five words below. |
+| `seconds` | number | Wall clock for the whole run, including parsing the agent definition and starting every tool server. |
+| `iterations` | number | Round trips to the model. Counted as each response arrives, so a contentless completion that was re-requested counts — it was waited on and it was billed. |
 
-Exit behavior summary:
+`ended_because` is the entire vocabulary:
 
-| Situation | Exit |
-| --- | --- |
-| Final response (`stop`/`end_turn`/`length`) | `0` |
-| Tool requested `session_ends` | `0` |
-| Max iterations reached | `2` |
-| Other error (provider/tool/config/runtime) | non-zero error |
+| Word | Meaning | Exit |
+| --- | --- | --- |
+| `completed` | The agent returned text, or a tool ended the session with `_meta.session_ends`. Both are successes. | `0` |
+| `iterations` | `--max-iterations` was reached. | `2` |
+| `runtime` | `--max-runtime-secs` was reached. | `2` |
+| `stopped` | The path given to `--stop-file` existed. | `2` |
+| `failed` | Anything else: the provider, a tool, a loop cut short for repeating itself. | non-zero error |
+
+Read `ended_because`, not the exit status. The three deliberate stops share `2` with each
+other and with clap's own argument-parsing error, so the status cannot tell them apart
+and no further statuses are being added: a number has too little room to say which
+ceiling was hit, while the word says it exactly.
+
+The same five words, with `seconds` and `iterations`, are also appended to the session
+file as `atoma_runs` — one record per run, so a resumed session carries the history of
+every run that touched it. Both are built from the same measurements. The difference is
+that the envelope describes one run and is always printed, while `atoma_runs` is the
+history and exists only when `--in-session` or `--out-session` asked for a file.
+
+The two stderr log lines are unchanged and still carry the same numbers for callers that
+grep: `ATOMA_TOKEN_USAGE` once per run, `ATOMA_INFERENCE_USAGE` once per round trip. They
+are no longer the only place the cache counts exist.
 
 ## Troubleshooting
 

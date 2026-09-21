@@ -102,11 +102,16 @@ pub enum CompletionReason {
 }
 
 /// Result of the inference loop.
+///
+/// Carries no usage. The totals are written into the caller's `total_usage` as each
+/// round trip reports one, for the same reason the inference count is: a completion is
+/// the one ending that could have returned them, and the endings that cannot -- the
+/// three soft stops and every failure -- are the ones whose bill somebody still has to
+/// be told about.
 pub enum InferenceResult {
     /// Normal completion with final text response.
     Completed {
         text: String,
-        usage: LlmUsage,
         reason: CompletionReason,
     },
     /// A tool requested session suspension (session_ends: true).
@@ -330,6 +335,13 @@ fn withhold_images(message: &Message) -> Message {
 /// run cut off by `--max-iterations` being the one somebody most wants the size of. A
 /// field on the returned value would only ever describe the runs that finished, while
 /// the caller records a run for all of them.
+///
+/// `total_usage` is an out parameter for the same reason, and used to be a field on the
+/// returned value: a run that spent 200k tokens and then hit its time limit reported no
+/// tokens at all, because the only path that carried them was the path that did not
+/// happen. It is summed here rather than by the caller because this is where the
+/// per-inference numbers arrive, and the two cache counts stay `None` until a provider
+/// reports one.
 #[allow(clippy::too_many_arguments)]
 pub async fn inference_loop(
     llm_client: &dyn LlmPort,
@@ -344,8 +356,8 @@ pub async fn inference_loop(
     stop_file: Option<&Path>,
     vision: bool,
     inferences: &mut usize,
+    total_usage: &mut LlmUsage,
 ) -> Result<InferenceResult> {
-    let mut total_usage = LlmUsage::default();
     let mut loop_tracker = LoopTracker::default();
     let mut consecutive_empty: u8 = 0;
     let started = Instant::now();
@@ -542,7 +554,6 @@ pub async fn inference_loop(
                     tracing::info!("LLM returned final response ({} chars)", text.len());
                     return Ok(InferenceResult::Completed {
                         text,
-                        usage: total_usage,
                         reason: CompletionReason::Stop,
                     });
                 }
@@ -559,7 +570,6 @@ pub async fn inference_loop(
                     );
                     return Ok(InferenceResult::Completed {
                         text,
-                        usage: total_usage,
                         reason: CompletionReason::Length,
                     });
                 }
