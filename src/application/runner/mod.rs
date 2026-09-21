@@ -224,24 +224,8 @@ fn record_run(session: &mut Session, started: &str, ended_because: &str, inferen
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    // `iterations` arrives as a parameter, counted by the loop that made the round
-    // trips. It used to be worked out here: the previous run record's `messages` value
-    // was read back off disk, used as the first index of this run's slice, and the
-    // assistant messages past it were counted. That rested on an assumption atoma does
-    // not enforce and cannot check -- that a session's `messages` array is only ever
-    // appended to between runs.
-    //
-    // An embedder that compacts or prunes the history breaks the assumption, and breaks
-    // it silently: the stored number then exceeds `session.messages.len()`, `skip`
-    // yields nothing, `count` is zero, and `atoma_runs` gains a record of a run that
-    // apparently never called the model. Nothing errors and nothing warns, so the only
-    // signal is a report that says a run which cost real money did no inference.
-    //
-    // The old comment here defended the read as the better trade: threading a second
-    // parameter through two functions to reach one line, against reading a number that
-    // is already written down. The parameter is the cheaper of the two after all, since
-    // the number written down is written by whoever embeds atoma and was believed
-    // without a check.
+    // `iterations` arrives as a parameter, counted where the round trips are made.
+    // `inference_loop` says what it used to be derived from and why that was wrong.
     let record = RunRecord {
         seconds: seconds_between(started, &ended),
         started: started.to_string(),
