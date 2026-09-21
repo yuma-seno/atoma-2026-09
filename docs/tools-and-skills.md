@@ -67,6 +67,13 @@ reason: `headers` on a server with no `url` would be a token that is never sent.
 Both lists are still per server, so a value reaches one server only by being named
 in that server's own block.
 
+That is the routing mechanism in both directions. A server atoma starts inherits
+this process's environment with the credential names removed first and its own
+`env` applied second — so naming `GH_TOKEN: "${GH_TOKEN}"` here is what puts it
+back, for that server alone, and a server that names nothing gets nothing. Which
+names are removed is the provider credentials plus whatever `protect_env` declares
+in `atoma.toml`; see [configuration.md](configuration.md).
+
 What the third form buys is worth stating, because it looks redundant. A server
 atoma starts is one whose **stderr and stdout atoma owns**, so its reports still
 reach the agent (see below) — and one that can be handed a credential through its

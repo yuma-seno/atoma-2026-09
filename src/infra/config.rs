@@ -16,6 +16,25 @@ use std::time::Duration;
 /// Top-level atoma.toml configuration file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomaConfig {
+    /// Environment variable names no tool server may inherit, on top of the
+    /// provider keys atoma already knows about.
+    ///
+    /// The caller's half of a list atoma cannot complete on its own. GitLab's
+    /// `CI_JOB_TOKEN`, a Slack token, an in-house secret named after an in-house
+    /// system: nothing in this crate has heard of them, so before this key they
+    /// were inherited straight into every server a run started, `shell` included.
+    ///
+    /// Top-level rather than per-profile, and that is the point rather than an
+    /// omission. A secret is a property of the project, not of the run: a name
+    /// protected under `--profile review` and inherited under `--profile ship`
+    /// is the kind of difference nobody notices until it has already leaked.
+    /// `[env]` is per-profile because setting a variable is a choice; this is a
+    /// floor.
+    ///
+    /// First among the fields because it is a TOML value rather than a table, and
+    /// serde's TOML serializer refuses a value emitted after one.
+    #[serde(default)]
+    pub protect_env: Vec<String>,
     #[serde(default)]
     pub defaults: DefaultsConfig,
     #[serde(default, rename = "profile")]
@@ -273,10 +292,36 @@ pub fn resolve_run_config(
     })
 }
 
+/// The names `atoma.toml` asked to keep out of every tool server.
+///
+/// A function rather than a field on `ResolvedConfig`, because there is nothing to
+/// resolve it against: no CLI flag to lose to and no profile override to merge, and
+/// the caller that needs it reaches it before any `ResolvedConfig` would help.
+/// `atoma validate --with-live-tools` starts real servers and has no run config at
+/// all, so a field on one would have left that path unprotected.
+pub fn protected_env_names(config: Option<&AtomaConfig>) -> Vec<String> {
+    match config {
+        Some(cfg) => cfg.protect_env.clone(),
+        None => Vec::new(),
+    }
+}
+
 /// Generate a default atoma.toml file.
 pub fn generate_default_config() -> String {
     r#"# Atoma configuration
 # See https://github.com/yuma-seno/atoma for documentation.
+
+# Environment variable names no tool server may inherit, on top of the provider
+# keys atoma already strips. Name your own secrets here -- CI tokens, chat tokens,
+# anything a `shell` server has no business reading out of its own environment.
+#
+# A server that legitimately needs one names it in its own `env` in the tools
+# file, which is applied after the removal and so puts it back -- for that one
+# server and no other.
+#
+# This key is top-level on purpose. Uncommented below a [table] header it would
+# belong to that table and do nothing.
+# protect_env = ["CI_JOB_TOKEN", "SLACK_BOT_TOKEN"]
 
 [defaults]
 # agent_def = "agents/default.md"
@@ -411,6 +456,26 @@ PROFILE_ONLY = "yes"
             resolved.env.get("PROFILE_ONLY").map(String::as_str),
             Some("yes")
         );
+    }
+
+    /// A protected name is a property of the project rather than of the run, so
+    /// the key is top-level and there is no profile that can narrow it.
+    #[test]
+    fn protected_names_are_read_from_the_top_level_key() {
+        let raw = r#"protect_env = ["CI_JOB_TOKEN"]"#;
+        let config: AtomaConfig = toml::from_str(raw).unwrap();
+        assert_eq!(protected_env_names(Some(&config)), vec!["CI_JOB_TOKEN"]);
+    }
+
+    /// Every existing atoma.toml predates this key, and none of them names it. An
+    /// absent list has to mean "nothing extra", not a parse error -- adding a
+    /// protection mechanism that stops every configured project from starting would
+    /// be a strange way to make them safer.
+    #[test]
+    fn a_config_without_the_key_protects_nothing_extra() {
+        let config: AtomaConfig = toml::from_str("[defaults]").unwrap();
+        assert!(protected_env_names(Some(&config)).is_empty());
+        assert!(protected_env_names(None).is_empty());
     }
 
     #[test]

@@ -33,6 +33,43 @@ Environment variable values loaded from config follow:
 
 At runtime, config-defined env values are only injected when that key is not already set in the process.
 
+## What a tool server does not inherit
+
+A tool server atoma starts inherits this process's environment **minus the names atoma
+treats as credentials**. It is not `env_clear()`: a server needs `PATH` to find its
+interpreter and `HOME` for its caches, and an allowlist of what a runtime needs is
+wrong the first time somebody adds a server written in another language.
+
+Two things make up that list, and neither is written out by hand:
+
+1. **Every provider credential this build knows** — including the names a provider
+   only falls back to, such as `GITHUB_TOKEN` and `GH_TOKEN` for `github-copilot`.
+   Adding a provider covers its names automatically, and the list is the whole
+   provider table rather than the provider this run resolved to, so a name is
+   stripped whichever provider is in use.
+2. **Whatever `protect_env` names.** atoma cannot know your secrets — GitLab's
+   `CI_JOB_TOKEN`, a Slack bot token, an in-house credential named after an in-house
+   system — so it takes them as values instead of guessing:
+
+```toml
+protect_env = ["CI_JOB_TOKEN", "SLACK_BOT_TOKEN"]
+```
+
+The key is **top-level**, above any `[table]` header. A bare key written below one
+belongs to that table and would do nothing. It is deliberately not per-profile: a
+name protected under one profile and inherited under another is the kind of
+difference nobody notices until it has leaked, so this is a floor for the whole
+project rather than a run setting.
+
+The removal happens before a server's own `env` is applied, so a server that
+legitimately needs one of them names it in its own `env` in the tools file and gets
+it back — for that one server and no other. See
+[tools-and-skills.md](tools-and-skills.md).
+
+In `--credentials-file` mode this is mostly moot, because none of these are in
+atoma's environment to begin with. It earns its place when atoma is run by hand with
+the secrets exported.
+
 ## Provider selection
 
 Provider resolution order:
@@ -120,6 +157,8 @@ Worst-case wall clock for one request is therefore roughly `3 × ATOMA_LLM_TIMEO
 ## Representative config
 
 ```toml
+protect_env = ["CI_JOB_TOKEN"]
+
 [defaults]
 agent_def = "agents/orchestrator.md"
 tools_file = "tools.yaml"

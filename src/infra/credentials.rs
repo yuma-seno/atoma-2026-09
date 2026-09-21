@@ -39,15 +39,66 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
+/// The names the caller declared, or unset when nothing has declared any.
+///
+/// Process-wide rather than carried through `McpFactory`, because two separate
+/// paths start a tool server and only one of them goes through a factory: a run,
+/// via `McpRegistry::from_configs`, and `atoma validate --with-live-tools`, via
+/// `infra::mcp::inspect` -- a free function that takes the definitions and nothing
+/// else. Threading the list through the first would have left the second starting
+/// `shell` with the caller's own secrets still in its environment, and nothing
+/// would have failed or said so. Registered once, before either path can exist, it
+/// covers both by construction.
+static DECLARED_ENV_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Record the names the caller asked to keep out of every tool server.
+///
+/// This is the whole of the caller's half, and it is values rather than knowledge:
+/// GitLab's `CI_JOB_TOKEN`, a Slack token, an in-house secret named after an
+/// in-house system. atoma cannot know them, and a core that tried to guess would be
+/// guessing forever, so `protect_env = [...]` in `atoma.toml` is how a project says
+/// which of its own secrets a `shell` server must not inherit.
+///
+/// A union with the provider names rather than a replacement for them: declaring
+/// one name must not be a way to un-protect a provider key.
+///
+/// Must be called before any tool server is started, and `main` does it as soon as
+/// the configuration is known. A second call is a defect rather than an override --
+/// two answers to "what is secret here" means one of them is being ignored -- so the
+/// first stands, because it is the one any server already started was built against.
+pub fn declare_protected_env_names(names: Vec<String>) {
+    if DECLARED_ENV_NAMES.set(sanitised(names)).is_err() {
+        tracing::warn!(
+            "protected environment names were declared more than once; the first declaration stands and the later one is ignored"
+        );
+    }
+}
+
+/// Drop what an environment variable name cannot be.
+///
+/// A trailing space inside a TOML string is easy to write and impossible to see,
+/// and `env_remove("GH_TOKEN ")` removes nothing at all. An entry that silently
+/// protects nothing is the worst kind of entry for a protection list to carry,
+/// because the list reads as though it covered the name.
+fn sanitised(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 /// The environment variables this program treats as credentials.
 ///
-/// Exactly the names atoma's own code reads a secret from — the provider keys in
-/// `infra/llm/*` and the GitHub tokens the tool servers authenticate with. Not an
-/// attempt to enumerate every secret a variable could hold; a list like that is
-/// wrong the moment someone invents a name nobody here thought of.
+/// The provider keys `infra/llm/*` declares, plus whatever the caller declared with
+/// [`declare_protected_env_names`]. Not an attempt to enumerate every secret a
+/// variable could hold; a list like that is wrong the moment someone invents a name
+/// nobody here thought of, which is exactly why the second half is taken from the
+/// caller instead of guessed.
 ///
 /// Used to keep them out of the environment of the tool servers this process
 /// spawns. A server that legitimately needs one names it in its own `env` in the
@@ -59,23 +110,40 @@ use anyhow::{Context, Result};
 /// how a developer runs atoma by hand: there the provider key really is inherited
 /// by every server, and `shell` could read it out of its own environment without
 /// going anywhere near `/proc`.
-/// The GitHub tokens. The provider keys come from the provider list itself, via
-/// [`credential_env_names`] below.
 ///
-/// Half of this list used to be provider keys, written out a second time. They drifted
-/// the day two providers were added: `OPENROUTER_API_KEY` and `ORCAROUTER_API_KEY`
-/// were declared in `infra::llm` and missing here, so in environment mode a tool
-/// server inherited them -- and `shell` could read a provider key out of its own
-/// environment without going near `/proc`.
-const GITHUB_ENV_NAMES: &[&str] = &["GH_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN"];
+/// Nothing is written out by hand here any more. This used to open with three
+/// GitHub names that were, each for a different reason, not knowledge this crate
+/// held. `GH_TOKEN` and `GITHUB_TOKEN` are declared by the Copilot provider and so
+/// are already in the provider half -- `provider_credential_names` is built from the
+/// whole static `PROVIDERS` table rather than from the provider a run resolved to,
+/// so they are stripped whichever provider is in use, and the test below fails if
+/// that ever stops being true. `GITHUB_PERSONAL_ACCESS_TOKEN` was read by no code in
+/// this repository and by none in the embedder that asked for it, which has since
+/// been retired: a name that entered the core for one caller's convenience and
+/// outlived the convenience.
+pub fn credential_env_names() -> Vec<String> {
+    match DECLARED_ENV_NAMES.get() {
+        Some(declared) => protected_union(declared),
+        None => protected_union(&[]),
+    }
+}
 
-/// Every name a tool server must not inherit.
+/// The union itself, over a declared list given rather than one registered.
 ///
-/// A union rather than a list: the provider half is whatever `infra::llm` declares, so
-/// adding a provider covers it here with nothing to remember.
-pub fn credential_env_names() -> Vec<&'static str> {
-    let mut names = crate::infra::llm::provider_credential_names();
-    names.extend_from_slice(GITHUB_ENV_NAMES);
+/// A union rather than a list: the provider half is whatever `infra::llm` declares,
+/// so adding a provider covers it here with nothing to remember, and the caller's
+/// half is whatever the caller said.
+///
+/// Split out from `credential_env_names` so the rule can be tested at all.
+/// `declare_protected_env_names` writes a `OnceLock` the whole test binary shares,
+/// so a test that called it would decide the answer for every test that ran after
+/// it -- and which tests those are depends on the order the harness happens to pick.
+fn protected_union(declared: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = crate::infra::llm::provider_credential_names()
+        .into_iter()
+        .map(String::from)
+        .collect();
+    names.extend_from_slice(declared);
     names.sort_unstable();
     names.dedup();
     names
@@ -231,6 +299,65 @@ pub fn expand_from_environment(template: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The GitHub tokens used to be written out here in a list of their own, and
+    /// deleting that list is only safe because `provider_credential_names` is built
+    /// from the whole static `PROVIDERS` table rather than from the provider a run
+    /// resolved to -- Copilot declares both, so both are stripped from every tool
+    /// server whichever provider the run is using.
+    ///
+    /// If that ever stops being true -- Copilot removed, or its `credential_names`
+    /// narrowed -- this fails here, at the place that decides, rather than silently
+    /// in a `shell` server's environment where nothing would report it.
+    #[test]
+    fn the_github_tokens_are_protected_without_a_list_of_their_own() {
+        let names = protected_union(&[]);
+        for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "{name} is missing from {names:?}"
+            );
+        }
+    }
+
+    /// A caller's own secret cannot be guessed by this crate, so it arrives as a
+    /// value. GitLab's `CI_JOB_TOKEN` was the measured case: inherited straight into
+    /// `shell` because nothing here had ever heard of it.
+    ///
+    /// A union, never a replacement: declaring one name must not be a way to make a
+    /// provider key inheritable again.
+    #[test]
+    fn a_declared_name_joins_the_provider_names_rather_than_replacing_them() {
+        let names = protected_union(&["CI_JOB_TOKEN".to_string()]);
+        let has = |name: &str| names.iter().any(|n| n == name);
+        assert!(has("CI_JOB_TOKEN"), "{names:?}");
+        assert!(has("ANTHROPIC_API_KEY"), "{names:?}");
+    }
+
+    /// Declaring a name the provider half already carries is not an error, and the
+    /// answer is still a set. `env_remove` is idempotent, so a duplicate would do no
+    /// harm at the call site -- but a list that can contain a name twice is not the
+    /// union this claims to be, and the next reader would have to work that out.
+    #[test]
+    fn a_name_declared_twice_over_appears_once() {
+        let declared = vec!["GH_TOKEN".to_string(), "GH_TOKEN".to_string()];
+        let names = protected_union(&declared);
+        let count = names.iter().filter(|n| *n == "GH_TOKEN").count();
+        assert_eq!(count, 1, "{names:?}");
+    }
+
+    /// A trailing space inside a TOML string is invisible to whoever wrote it, and
+    /// `env_remove("CI_JOB_TOKEN ")` removes nothing. A protection list that reads as
+    /// though it covered a name and does not is the one failure it cannot afford.
+    #[test]
+    fn a_padded_or_empty_declaration_is_dropped_rather_than_registered() {
+        let given = vec![
+            " CI_JOB_TOKEN ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(sanitised(given), vec!["CI_JOB_TOKEN".to_string()]);
+    }
 
     fn from_pairs(pairs: &[(&str, &str)]) -> Credentials {
         Credentials {

@@ -76,6 +76,13 @@ async fn main() -> Result<()> {
             )?;
             let output_format = resolved.output.clone();
 
+            // Before the loop below, which may put one of these names into this
+            // process's own environment, and long before anything exists that could
+            // start a tool server. `declare_protected_env_names` says why the list
+            // is registered rather than carried to the one place that spawns.
+            let protect = config_module::protected_env_names(config.as_ref());
+            infra::credentials::declare_protected_env_names(protect);
+
             for (key, value) in &resolved.env {
                 if std::env::var(key).is_err() {
                     std::env::set_var(key, value);
@@ -196,6 +203,18 @@ async fn main() -> Result<()> {
             // Also opt-in, and for the same reason: it needs more than the default
             // check has. See `validate_live_tools`.
             if with_live_tools {
+                // This starts real tool servers with this process's environment, so
+                // the caller's declared names have to reach it too -- it is the
+                // second spawning path, and the one a change to the run path would
+                // silently leave behind.
+                //
+                // Read here rather than at the top of the arm: a plain `atoma
+                // validate` starts nothing, and should not begin failing because an
+                // unrelated key in atoma.toml will not parse.
+                let config = config_module::discover_and_load()?.1;
+                let protect = config_module::protected_env_names(config.as_ref());
+                infra::credentials::declare_protected_env_names(protect);
+
                 match tools_file {
                     Some(path) => {
                         application::validator::validate_live_tools(
