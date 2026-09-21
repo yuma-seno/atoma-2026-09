@@ -181,6 +181,7 @@ async fn main() -> Result<()> {
             template,
             credentials_present,
             with_live_tools,
+            strict,
         } => {
             let agent_def_port = infra::persistence::agent_def::FileAgentDefAdapter;
             let tool_def_port = infra::persistence::tool_def::FileToolDefAdapter::default();
@@ -188,6 +189,7 @@ async fn main() -> Result<()> {
                 agent_def.clone(),
                 tools_file.clone(),
                 template,
+                strict,
                 &agent_def_port,
                 &tool_def_port,
             )?;

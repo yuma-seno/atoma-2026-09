@@ -216,6 +216,22 @@ pub enum Command {
         /// here and refuses every call at run time.
         #[arg(long)]
         with_live_tools: bool,
+
+        /// Treat every warning as an error
+        ///
+        /// A warning is a configuration atoma can act on and finds unusual, or a
+        /// check this run could not make: a server setting both `tool_allowlist` and
+        /// `tool_denylist`, whose precedence is defined and which a run only warns
+        /// about, or `mcp_servers` named with no `--tools-file` to check them
+        /// against. Off, they are printed and the command succeeds -- the answer a
+        /// run gives for the same file, which is where the default comes from.
+        ///
+        /// On for a caller whose policy is that a pull request may carry neither.
+        /// Whether that is the policy is not something atoma can know, so it is asked
+        /// for rather than assumed: the same reasoning as `atoma run
+        /// --fail-on-tool-findings`, and the same direction.
+        #[arg(long)]
+        strict: bool,
     },
 
     /// Generate a default atoma.toml configuration file

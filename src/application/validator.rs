@@ -19,7 +19,6 @@ use crate::infra::template::unknown_placeholders;
 ///   4. If a tools file is provided:
 ///      a. The tools file parses without error.
 ///      b. Each `mcp_servers` entry is present in the tools file.
-///      c. No server sets both `tool_allowlist` and `tool_denylist`.
 ///   5. `provider`, when named, is one this build has.
 ///   8. If a template is provided: every `{{...}}` in it is one that gets
 ///      substituted.
@@ -29,14 +28,34 @@ use crate::infra::template::unknown_placeholders;
 /// definition a pull request would merge; checking them there would mean keeping a
 /// copy of the provider list and of the template vocabulary in another repository,
 /// in another language.
+///
+/// Findings come in two kinds, and `strict` is the caller's answer about the second.
+/// An error is a definition that cannot do what it says: a `knows_about` target with
+/// no file behind it, a provider this build does not have. A warning is a
+/// configuration that is defined and merely unusual, or a check this run could not
+/// make. Without `strict` a warning is printed and the command still succeeds; with
+/// it, every warning is an error.
+///
+/// The flag exists because the alternative was this function deciding. A server
+/// setting both `tool_allowlist` and `tool_denylist` was fatal HERE while
+/// `describe_hooks` warned about the same configuration and let the run proceed,
+/// `docs/tools-and-skills.md` said both may be set, and the field doc on
+/// `domain::tool::Hooks` gave the precedence -- three places describing a
+/// well-defined configuration and a fourth refusing it, leaving a reader no way to
+/// know which one the program obeyed. The reason recorded for refusing was that a
+/// delivery runs this over every pull request, which is that delivery's policy and
+/// not a fact about the file. So the default is now the answer a run gives, and a
+/// caller who wants the old one asks for it.
 pub fn validate(
     agent_def_path: PathBuf,
     tools_file: Option<PathBuf>,
     template_file: Option<PathBuf>,
+    strict: bool,
     agent_def_port: &dyn AgentDefPort,
     tool_def_port: &dyn ToolDefPort,
 ) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     let parsed_agent = match agent_def_port.parse(&agent_def_path) {
         Ok(a) => {
@@ -148,14 +167,19 @@ pub fn validate(
             match tool_def_port.load(tools_path) {
                 Ok(tools_map) => {
                     println!("✓ Tools file parsed: {} server(s) defined", tools_map.len());
-                    // Both lists has a defined meaning -- the denylist is checked
-                    // first -- and no defined intent. Which one the author meant is
-                    // not recoverable from the file, so the file is the thing to fix.
+                    // Both lists has a defined meaning: the denylist is checked
+                    // first, so a tool named in both is blocked. `check_access` acts
+                    // on that order, the field doc on `domain::tool::Hooks` states
+                    // it, a test in `infra::hooks` pins it, and `describe_hooks`
+                    // warns rather than refusing. This used to call the same file
+                    // fatal, which left a reader four descriptions of one
+                    // configuration and no way to tell which the program obeyed.
                     //
-                    // Here rather than at startup: the runtime check runs after every
-                    // server has been spawned, which is too late to be worth failing
-                    // over, and it is not reached by validation at all. This is the
-                    // check a delivery runs over every pull request.
+                    // Still said here, because validation is where it is cheap to
+                    // hear: the runtime warning arrives only after every server has
+                    // been spawned. Said at the volume the run uses, and a caller
+                    // whose policy is stricter than the runtime's says so with
+                    // `--strict`.
                     let mut both: Vec<&str> = tools_map
                         .iter()
                         .filter(|(_, def)| {
@@ -166,10 +190,10 @@ pub fn validate(
                         .collect();
                     both.sort_unstable();
                     for server in both {
-                        errors.push(format!(
+                        warnings.push(format!(
                             "Server '{}' sets both tool_allowlist and tool_denylist. \
-                             Keep one: an allowlist says what may be called, a denylist says \
-                             what may not, and a tool named in both is blocked.",
+                             The denylist is checked first, so a tool matching both is \
+                             blocked.",
                             server
                         ));
                     }
@@ -193,8 +217,15 @@ pub fn validate(
                 }
             }
         } else if !agent.mcp_servers.is_empty() {
-            println!(
-                "  ⚠ mcp_servers is non-empty but --tools-file was not provided; skipping server check"
+            // A warning rather than a line of prose in the middle of the output.
+            // Every server check above needed the file that was not passed, so this
+            // run answered less than its "Validation passed." suggests -- and a
+            // caller that asked for `--strict` is exactly the one for whom a check
+            // that did not happen should count.
+            warnings.push(
+                "mcp_servers is non-empty but --tools-file was not provided; \
+                 the servers it names were not checked"
+                    .to_string(),
             );
         }
     }
@@ -225,6 +256,17 @@ pub fn validate(
                 template_path, e
             )),
         }
+    }
+
+    // `strict` is the caller's policy about warnings and not a second opinion about
+    // the configuration: what each check found is unchanged, and only the exit status
+    // moves. Applied here rather than at each check so that a warning added later
+    // cannot forget to honour it.
+    if strict {
+        errors.append(&mut warnings);
+    }
+    for warning in &warnings {
+        println!("  ⚠ {}", warning);
     }
 
     if errors.is_empty() {
@@ -381,21 +423,22 @@ mod tests {
         path
     }
 
-    /// Both lists on one server, refused where refusing it helps.
+    /// Both lists on one server: unusual, defined, and not this command's call.
     ///
-    /// It was fatal once and became a warning, and the reason recorded was placement
-    /// rather than the rule: the check sat inside the registry, after every server had
-    /// been spawned, and validation never reached it -- so a tools file that would have
-    /// been rejected passed clean. Nothing is spawned here, and this is the check a
-    /// delivery runs over every pull request.
+    /// It was fatal here while `describe_hooks` warned about the same configuration
+    /// and let the run go on, and while two documents and a test in `infra::hooks`
+    /// described the precedence it obeys. The precedence is real, so the file is not
+    /// wrong -- and a validator calling it fatal left a reader four descriptions of
+    /// one configuration with no way to tell which the program acts on.
     ///
     /// `validate` reports its findings to stderr and returns only that it failed, so
-    /// this cannot read the message. What isolates the rule is the PAIR: the same file
-    /// with one list passes. The first version of both wrote `command: true`, which is
-    /// a boolean to YAML and a string to `ToolDef` -- so this one passed on the parse
-    /// error and never reached the rule at all, and only its partner said so.
+    /// this cannot read the message. What isolates the rule is the PAIR with
+    /// `a_server_setting_both_lists_is_fatal_under_strict`: the same file, the same
+    /// call, and only the caller's policy different. The first version of this test
+    /// wrote `command: true`, which is a boolean to YAML and a string to `ToolDef`
+    /// -- so it passed on the parse error and never reached the rule at all.
     #[test]
-    fn a_server_setting_both_lists_is_a_validation_error() {
+    fn a_server_setting_both_lists_is_a_warning_rather_than_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let agent = write_agent(dir.path(), "solo", "mcp_servers: [fs]\n");
         let tools = write_tools(
@@ -406,10 +449,65 @@ mod tests {
             agent,
             Some(tools),
             None,
+            false,
+            &FileAgentDefAdapter,
+            &FileToolDefAdapter::default(),
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// The same file under the policy that used to be built in.
+    ///
+    /// `--strict` is the whole of what a caller that wanted the refusal has to do:
+    /// a delivery gating pull requests on this configuration keeps its answer by
+    /// asking for it, and nothing else in the codebase has to agree with that
+    /// choice.
+    #[test]
+    fn a_server_setting_both_lists_is_fatal_under_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = write_agent(dir.path(), "solo", "mcp_servers: [fs]\n");
+        let tools = write_tools(
+            dir.path(),
+            "fs:\n  command: \"/bin/true\"\n  hooks:\n    tool_allowlist: [\"fs__read\"]\n    tool_denylist: [\"fs__write\"]\n",
+        );
+        let result = validate(
+            agent,
+            Some(tools),
+            None,
+            true,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
         assert!(result.is_err());
+    }
+
+    /// The other warning, and the reason the category is not just the one rule: a
+    /// definition naming servers with no tools file to check them against is a check
+    /// that did not happen. Without `--strict` it passes, because `run` resolves the
+    /// tools file from its own arguments or from `atoma.toml` and validating the
+    /// definition alone is a legitimate thing to ask for.
+    #[test]
+    fn mcp_servers_without_a_tools_file_is_a_warning_that_strict_makes_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = write_agent(dir.path(), "solo", "mcp_servers: [fs]\n");
+        assert!(validate(
+            agent.clone(),
+            None,
+            None,
+            false,
+            &FileAgentDefAdapter,
+            &FileToolDefAdapter::default()
+        )
+        .is_ok());
+        assert!(validate(
+            agent,
+            None,
+            None,
+            true,
+            &FileAgentDefAdapter,
+            &FileToolDefAdapter::default()
+        )
+        .is_err());
     }
 
     /// One list is the ordinary case and stays ordinary.
@@ -425,6 +523,7 @@ mod tests {
             agent,
             Some(tools),
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
@@ -441,6 +540,7 @@ mod tests {
             path,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
@@ -459,6 +559,7 @@ mod tests {
             path,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
@@ -473,6 +574,7 @@ mod tests {
             path,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default()
         )
@@ -489,6 +591,7 @@ mod tests {
             path,
             None,
             Some(template),
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
@@ -509,6 +612,7 @@ mod tests {
             path,
             None,
             Some(template),
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
@@ -526,6 +630,7 @@ mod tests {
             path,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
@@ -545,6 +650,7 @@ mod tests {
                 path,
                 None,
                 None,
+                false,
                 &FileAgentDefAdapter,
                 &FileToolDefAdapter::default()
             )
@@ -570,6 +676,7 @@ mod tests {
                     path,
                     None,
                     None,
+                    false,
                     &FileAgentDefAdapter,
                     &FileToolDefAdapter::default()
                 )
@@ -598,6 +705,7 @@ mod tests {
                     path,
                     None,
                     None,
+                    false,
                     &FileAgentDefAdapter,
                     &FileToolDefAdapter::default()
                 )
@@ -621,6 +729,7 @@ mod tests {
             path,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default()
         )
@@ -640,6 +749,7 @@ mod tests {
             path,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default()
         )
@@ -658,6 +768,7 @@ mod tests {
             path,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default()
         )
@@ -676,6 +787,7 @@ mod tests {
             caller,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );
@@ -692,6 +804,7 @@ mod tests {
             caller,
             None,
             None,
+            false,
             &FileAgentDefAdapter,
             &FileToolDefAdapter::default(),
         );

@@ -204,6 +204,16 @@ Validation checks:
 - `extra_body.tools`, when present, is an array so it can be merged with the runtime tool definitions. See [agents.md](agents.md).
 - `mcp_servers` entries exist in `tools.yaml` when a tools file is given.
 
+Two findings are warnings rather than errors: a server that sets both
+`tool_allowlist` and `tool_denylist` — defined, since the denylist is checked first,
+and allowed at run time — and `mcp_servers` named with no `--tools-file` to check
+them against, which is a check that did not happen. Both are printed and the command
+still succeeds, which is the answer `atoma run` gives for the same configuration.
+
+`--strict` makes every warning an error. Whether a pull request may carry one is the
+caller's policy, not something atoma can know, so it is asked for rather than
+assumed — the counterpart of `atoma run --fail-on-tool-findings`.
+
 `--with-live-tools` adds one more check that a file alone cannot answer: it starts
 every declared server, asks what it advertises, and fails on anything wrong with the
 configuration — a guard pattern matching nothing, a tool name two servers claim. That

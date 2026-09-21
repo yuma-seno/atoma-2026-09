@@ -255,7 +255,10 @@ Hook rules:
 - `tool_allowlist` and `tool_denylist` may both be set. The denylist is checked first,
   so a tool matching both is blocked. Setting both logs a warning naming that order,
   because it is unusual rather than wrong — it used to be refused as "ambiguous" while the
-  code, this document and a test all described the precedence.
+  code, this document and a test all described the precedence. `atoma validate` says the
+  same thing at the same volume and also goes on; `atoma validate --strict` is how a
+  caller whose own policy forbids it gets a non-zero exit. See
+  [configuration.md](configuration.md#validation-workflow).
 - Pattern matching supports exact match or trailing `*` wildcard.
 - `before_tool` is fail-closed:
   - non-zero exit, timeout, or invalid JSON blocks the call.
