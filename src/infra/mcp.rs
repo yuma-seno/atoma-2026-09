@@ -2107,8 +2107,13 @@ mod finding_line_tests {
     fn a_fatal_finding_emits_its_line_before_the_run_is_refused() {
         let report = report_on(&[duplicate_tool()], false);
         assert_eq!(report.lines.len(), 1, "{:?}", report.lines);
+        // Destructured rather than indexed twice: the flag is what now picks the log
+        // level, so a test that reads the line without reading the flag would pass
+        // while the line went out at the wrong severity.
+        let (fatal, line) = &report.lines[0];
+        assert!(*fatal, "a duplicate tool name is fatal");
         assert!(
-            report.lines[0].1.contains("kind=duplicate_tool severity=error"),
+            line.contains("kind=duplicate_tool severity=error"),
             "{:?}",
             report.lines,
         );
