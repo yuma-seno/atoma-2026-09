@@ -61,9 +61,17 @@ pub struct Capped {
 /// character — which would be a panic on a `&str` slice, and a run that dies because
 /// a tool returned Japanese.
 ///
-/// The marker names the number of characters dropped and where from. A truncated
-/// result that does not say it is truncated is worse than a short one: a `grep` that
-/// matched everything and a file that contains nothing look the same.
+/// The marker names the number of characters dropped, where from, and WHO dropped
+/// them. A truncated result that does not say it is truncated is worse than a short
+/// one: a `grep` that matched everything and a file that contains nothing look the
+/// same.
+///
+/// The last of those is not decoration. A tool server may cap its own output before
+/// returning it -- one that knows what it produced can often project rather than cut,
+/// which loses nothing -- and this cap may then cut the result again. Two notes sit in
+/// one tool result with two sets of numbers, and a person reading the session cannot
+/// tell which of them describes the loss in front of them. Naming atoma costs seven
+/// characters and answers that.
 pub fn cap(text: &str, limit: usize) -> Capped {
     let total = text.chars().count();
     if total <= limit {
@@ -84,7 +92,7 @@ pub fn cap(text: &str, limit: usize) -> Capped {
 
     Capped {
         text: format!(
-            "{head}\n\n[{dropped} characters dropped from the middle; {limit} shown]\n\n{tail}"
+            "{head}\n\n[atoma: {dropped} characters dropped from the middle; {limit} shown]\n\n{tail}"
         ),
         dropped,
     }
