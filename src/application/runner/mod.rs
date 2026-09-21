@@ -2,6 +2,7 @@
 //! MCP connection, and the inference loop.
 
 mod execution;
+mod report;
 
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -10,8 +11,8 @@ use std::time::Duration;
 
 use crate::application::tools::RuntimeTools;
 use crate::domain::ports::{
-    AgentDefPort, LlmPort, LlmUsage, McpFactory, PromptContext, SessionPort, SkillPort,
-    TemplatePort, ToolDefPort, ToolPort,
+    AgentDefPort, LlmPort, McpFactory, PromptContext, SessionPort, SkillPort, TemplatePort,
+    ToolDefPort, ToolPort,
 };
 use crate::domain::session::{
     answer_unanswered_tool_calls, Message, Session, TOOL_CALL_UNANSWERED,
@@ -31,6 +32,7 @@ use serde_json::Value;
 use execution::{MaxIterationsReached, RunTimeExceeded, StopRequested};
 
 pub use execution::{inference_loop, is_soft_stop, CompletionReason, InferenceResult};
+pub use report::{envelope, RunFacts, RunOutcome};
 
 // ── Bundled parameter structs ────────────────────────────────────────────────
 
@@ -54,18 +56,6 @@ pub struct RunSettings {
     /// configuration is a path that might already exist when a run starts, which would
     /// stop every run immediately. It belongs to one invocation.
     pub stop_file: Option<PathBuf>,
-}
-
-/// Observable outcome of a completed run. Presentation belongs to the caller.
-#[derive(Debug)]
-pub enum RunOutcome {
-    Completed {
-        text: String,
-        usage: LlmUsage,
-        reason: CompletionReason,
-        session_path: Option<PathBuf>,
-    },
-    SessionEnded,
 }
 
 /// External dependencies (ports) required by the runner.
@@ -150,89 +140,33 @@ pub struct RunRecord {
     pub iterations: usize,
 }
 
-/// Now, as RFC 3339 in UTC.
-///
-/// Formatted from a Unix timestamp rather than by adding a date crate for two calls. The
-/// civil-date arithmetic is Howard Hinnant's `civil_from_days`, exact for every date this
-/// will see.
-fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = secs.div_euclid(86_400);
-    let time = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year,
-        m,
-        d,
-        time / 3_600,
-        (time % 3_600) / 60,
-        time % 60
-    )
-}
-
-/// Whole seconds between two stamps this module produced, or 0.
-///
-/// Only ever given its own output, so it parses by position. Zero rather than an error
-/// for anything unexpected: a duration nobody can compute is not a reason to lose a
-/// session.
-fn seconds_between(started: &str, ended: &str) -> u64 {
-    fn epoch(s: &str) -> Option<i64> {
-        if s.len() < 20 {
-            return None;
-        }
-        let num = |from: usize, to: usize| s.get(from..to)?.parse::<i64>().ok();
-        let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-        let (hh, mm, ss) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-        let y2 = if m <= 2 { y - 1 } else { y };
-        let era = y2.div_euclid(400);
-        let yoe = y2 - era * 400;
-        let mp = if m > 2 { m - 3 } else { m + 9 };
-        let doy = (153 * mp + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        Some((era * 146_097 + doe - 719_468) * 86_400 + hh * 3_600 + mm * 60 + ss)
-    }
-    match (epoch(started), epoch(ended)) {
-        (Some(a), Some(b)) if b >= a => (b - a) as u64,
-        _ => 0,
-    }
-}
-
 /// Append this run to the session's own record of its runs.
 ///
 /// Never fails the save. A session that could not be described is still a session worth
 /// keeping, and this runs immediately before a run that may already be failing writes
 /// whatever it reached.
-fn record_run(session: &mut Session, started: &str, ended_because: &str, inferences: usize) {
-    let ended = now_rfc3339();
-
+///
+/// Every field comes out of the `RunFacts` the envelope is also built from, so the
+/// history and the machine-readable output are the same measurement written twice rather
+/// than two measurements that can disagree. This record is no longer the only channel:
+/// it is the per-run history, which is what a resumed session needs and what a single
+/// run's envelope cannot be.
+fn record_run(session: &mut Session, facts: &RunFacts) {
     let mut runs: Vec<Value> = session
         .extra
         .get(RUNS_KEY)
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    // `iterations` arrives as a parameter, counted where the round trips are made.
+    // `iterations` is counted where the round trips are made, not derived here.
     // `inference_loop` says what it used to be derived from and why that was wrong.
     let record = RunRecord {
-        seconds: seconds_between(started, &ended),
-        started: started.to_string(),
-        ended,
-        ended_because: ended_because.to_string(),
+        started: facts.started.clone(),
+        ended: facts.ended.clone(),
+        seconds: facts.seconds,
+        ended_because: facts.ended_because.to_string(),
         messages: session.messages.len(),
-        iterations: inferences,
+        iterations: facts.iterations,
     };
     match serde_json::to_value(&record) {
         Ok(value) => runs.push(value),
@@ -268,13 +202,11 @@ fn save_whatever_was_reached(
     session: &mut Session,
     out_path: Option<&std::path::Path>,
     port: &dyn SessionPort,
-    started: &str,
-    ended_because: &str,
-    inferences: usize,
+    facts: &RunFacts,
 ) {
     let Some(path) = out_path else { return };
 
-    record_run(session, started, ended_because, inferences);
+    record_run(session, facts);
 
     let repaired = answer_unanswered_tool_calls(session, TOOL_CALL_UNANSWERED);
     if repaired > 0 {
@@ -291,7 +223,43 @@ fn save_whatever_was_reached(
 }
 
 /// Run the agent: parse agent def, load session, connect MCP, run inference loop, save session.
-pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome> {
+///
+/// `facts` is filled in as the run goes, and is the caller's channel for everything that
+/// is not the agent's answer: why the run ended, how long it took, how many round trips
+/// it made and what they cost. An out parameter because the endings that are not a
+/// completion leave through `Err` and could carry none of it -- which is how the three
+/// soft stops came to be indistinguishable from each other, and from a clap parse error,
+/// at exit status 2.
+pub async fn run(
+    settings: RunSettings,
+    deps: RunDeps<'_>,
+    facts: &mut RunFacts,
+) -> Result<RunOutcome> {
+    let outcome = run_inner(settings, deps, facts).await;
+    // Every `?` inside leaves without naming an ending: a tools file that will not
+    // parse, a server that will not start, an agent listed in `knows_about` that is not
+    // there. Those failures can carry a minute of tool-server startup with them, and
+    // `conclude` is what stamps the clock -- so an ending that never reached one would
+    // report `seconds: 0` for a run that really spent that minute. Named here, once,
+    // for whatever got past the inner function without saying how it ended.
+    //
+    // `ended` is empty exactly until something concludes, which is why it is the test.
+    if facts.ended.is_empty() {
+        let because = match &outcome {
+            Ok(_) => "completed",
+            Err(e) => ending_of(e),
+        };
+        facts.conclude(because);
+    }
+    outcome
+}
+
+/// The run itself. Wrapped only so that the endings it leaves through `?` are named.
+async fn run_inner(
+    settings: RunSettings,
+    deps: RunDeps<'_>,
+    facts: &mut RunFacts,
+) -> Result<RunOutcome> {
     let RunSettings {
         agent_def_path,
         in_session,
@@ -308,7 +276,7 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
     // Before anything else, so the duration covers what the run actually spent --
     // including parsing an agent definition and starting every tool server, which is
     // fixed overhead anybody looking at a slow run wants counted.
-    let started = now_rfc3339();
+    facts.start();
 
     // 1. Parse agent definition
     let parsed_agent = deps
@@ -459,13 +427,16 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
     };
 
     let out_path = out_session.or(in_session);
+    // Recorded whether or not the save below succeeds, and recorded here rather than on
+    // the one path that returns an outcome: a run that was interrupted still wrote its
+    // session, and where it went is the first thing its caller needs to resume it.
+    facts.session_path = out_path.clone();
 
-    // Written by the loop as it goes, so that it is still right on the paths that never
-    // return an `InferenceResult`: a ceiling reached, a stop file, a provider hanging
-    // up. Zero here is the honest starting value -- a run that fails before its first
-    // response really did make no round trip.
-    let mut inferences: usize = 0;
-
+    // The count and the token totals are written by the loop as it goes, so that they
+    // are still right on the paths that never return an `InferenceResult`: a ceiling
+    // reached, a stop file, a provider hanging up. Zero is the honest starting value --
+    // a run that fails before its first response really did make no round trip and
+    // really was billed for nothing.
     let inference_result = inference_loop(
         deps.llm,
         &agent.name,
@@ -478,16 +449,13 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
         max_runtime,
         stop_file.as_deref(),
         agent.vision,
-        &mut inferences,
+        &mut facts.iterations,
+        &mut facts.usage,
     )
     .await;
 
-    let (response_text, total_usage, completion_reason) = match inference_result {
-        Ok(InferenceResult::Completed {
-            text,
-            usage,
-            reason,
-        }) => (text, usage, reason),
+    let (response_text, completion_reason) = match inference_result {
+        Ok(InferenceResult::Completed { text, reason }) => (text, reason),
         Ok(InferenceResult::SessionEnded) => {
             tracing::info!("Session suspended by tool request");
             // Through the same door as every other ending, which it was not before:
@@ -500,14 +468,8 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
             //
             // `completed`, because nothing gave up here. The mechanism did not stop this
             // run; the agent reached an outcome and said so with a tool.
-            save_whatever_was_reached(
-                &mut session,
-                out_path.as_deref(),
-                deps.session,
-                &started,
-                "completed",
-                inferences,
-            );
+            facts.conclude("completed");
+            save_whatever_was_reached(&mut session, out_path.as_deref(), deps.session, facts);
             return Ok(RunOutcome::SessionEnded);
         }
         Err(e) => {
@@ -529,21 +491,23 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
             } else {
                 tracing::error!("Run failed: {}", e);
             }
-            save_whatever_was_reached(
-                &mut session,
-                out_path.as_deref(),
-                deps.session,
-                &started,
-                ending_of(&e),
-                inferences,
-            );
+            facts.conclude(ending_of(&e));
+            save_whatever_was_reached(&mut session, out_path.as_deref(), deps.session, facts);
             return Err(e);
         }
     };
 
+    facts.conclude("completed");
+
+    // Unchanged, down to the words it uses. The two cache counts are now in the
+    // `--output json` envelope as well, which is the point -- this line used to be the
+    // only place they existed, so the human-readable channel carried more than the
+    // machine-readable one -- but a caller that greps this line keeps working.
+    //
     // `cached=` says `unknown` rather than `0` when no inference reported one. The
     // reader of this line is a delivery script and then a person, and `0` is a claim
     // about the cache while `unknown` is a claim about the measurement.
+    let total_usage = facts.usage;
     tracing::info!(
         "ATOMA_TOKEN_USAGE: prompt={} completion={} total={} cached={} written={}",
         total_usage.prompt_tokens,
@@ -559,20 +523,11 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
 
     // 8. Save session, through the helper the failing path already used -- which is what
     // puts every ending in `atoma_runs` rather than only the unhappy ones.
-    save_whatever_was_reached(
-        &mut session,
-        out_path.as_deref(),
-        deps.session,
-        &started,
-        "completed",
-        inferences,
-    );
+    save_whatever_was_reached(&mut session, out_path.as_deref(), deps.session, facts);
 
     Ok(RunOutcome::Completed {
         text: response_text,
-        usage: total_usage,
         reason: completion_reason,
-        session_path: out_path,
     })
 }
 
@@ -580,13 +535,28 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
 mod tests {
     use super::*;
 
-    fn iterations_of(session: &Session, index: usize) -> Option<u64> {
+    /// A run's facts as the runner would have left them, with the count the loop made.
+    fn facts_for(ended_because: &'static str, iterations: usize) -> RunFacts {
+        let mut facts = RunFacts {
+            iterations,
+            ..RunFacts::default()
+        };
+        facts.start();
+        facts.conclude(ended_because);
+        facts
+    }
+
+    fn run_field(session: &Session, index: usize, field: &str) -> Option<Value> {
         let runs = session
             .extra
             .get(RUNS_KEY)
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
-        runs.get(index)?.get("iterations").and_then(Value::as_u64)
+        runs.get(index)?.get(field).cloned()
+    }
+
+    fn iterations_of(session: &Session, index: usize) -> Option<u64> {
+        run_field(session, index, "iterations")?.as_u64()
     }
 
     /// The case that used to record zero. The previous run wrote `messages: 400`, then
@@ -600,7 +570,7 @@ mod tests {
         let previous = serde_json::json!([{ "messages": 400 }]);
         session.extra.insert(RUNS_KEY.to_string(), previous);
 
-        record_run(&mut session, "2026-01-01T00:00:00Z", "completed", 7);
+        record_run(&mut session, &facts_for("completed", 7));
 
         assert_eq!(iterations_of(&session, 1), Some(7));
     }
@@ -611,8 +581,28 @@ mod tests {
     fn a_first_run_reports_the_count_it_was_given() {
         let mut session = Session::default();
 
-        record_run(&mut session, "2026-01-01T00:00:00Z", "completed", 3);
+        record_run(&mut session, &facts_for("completed", 3));
 
         assert_eq!(iterations_of(&session, 0), Some(3));
+    }
+
+    /// The session and the envelope have to say the same thing about the same run. They
+    /// are two channels now -- the session file is no longer the only place a caller can
+    /// learn why a run ended -- and two channels built from two sources are two channels
+    /// that drift. Both are built from one `RunFacts`, and this is what says so.
+    #[test]
+    fn the_session_and_the_envelope_name_the_same_ending() {
+        let mut session = Session::default();
+        let facts = facts_for("iterations", 12);
+
+        record_run(&mut session, &facts);
+
+        let reported = envelope(&facts, None);
+        let recorded_ending = run_field(&session, 0, "ended_because");
+        let recorded_seconds = run_field(&session, 0, "seconds");
+        assert_eq!(reported["ended_because"], "iterations");
+        assert_eq!(reported["iterations"], 12);
+        assert_eq!(Some(reported["ended_because"].clone()), recorded_ending);
+        assert_eq!(Some(reported["seconds"].clone()), recorded_seconds);
     }
 }
