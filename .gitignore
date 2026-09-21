@@ -27,3 +27,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .bash_history
+
+# Agent worktrees and scratch, never part of the source.
+.claude/
