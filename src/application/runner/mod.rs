@@ -138,6 +138,12 @@ pub struct RunRecord {
     /// round trip take here` meant parsing `Inference iteration N` out of a workflow
     /// log, which is not a thing a report should need.
     ///
+    /// Counted by the inference loop as each round trip returns and carried down to this
+    /// record. It used to be derived here instead, from the previous run's `messages`
+    /// value as written on disk, which recorded zero -- silently -- for any embedder
+    /// that compacts or prunes a session's history between runs. A round trip that came
+    /// back empty and was re-requested counts: it was waited on and it was billed.
+    ///
     /// `#[serde(default)]` because sessions written before this field exists are read
     /// back, and zero is the honest answer for a run that never recorded it.
     #[serde(default)]
@@ -209,7 +215,7 @@ fn seconds_between(started: &str, ended: &str) -> u64 {
 /// Never fails the save. A session that could not be described is still a session worth
 /// keeping, and this runs immediately before a run that may already be failing writes
 /// whatever it reached.
-fn record_run(session: &mut Session, started: &str, ended_because: &str) {
+fn record_run(session: &mut Session, started: &str, ended_because: &str, inferences: usize) {
     let ended = now_rfc3339();
 
     let mut runs: Vec<Value> = session
@@ -218,33 +224,31 @@ fn record_run(session: &mut Session, started: &str, ended_because: &str) {
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    // Where this run's messages begin: where the last one's ended. Taken from the
-    // record rather than threaded down from the top of `run`, because the run's start
-    // is decided before the session is even loaded -- and a second parameter carried
-    // through two functions to reach one line is a worse trade than reading the number
-    // that is already written down.
+    // `iterations` arrives as a parameter, counted by the loop that made the round
+    // trips. It used to be worked out here: the previous run record's `messages` value
+    // was read back off disk, used as the first index of this run's slice, and the
+    // assistant messages past it were counted. That rested on an assumption atoma does
+    // not enforce and cannot check -- that a session's `messages` array is only ever
+    // appended to between runs.
     //
-    // A session rebuilt from scratch has no previous run and starts at zero, which is
-    // also right.
-    let first = runs
-        .last()
-        .and_then(|r| r.get("messages"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    let iterations = session
-        .messages
-        .iter()
-        .skip(first)
-        .filter(|m| m.role == "assistant")
-        .count();
-
+    // An embedder that compacts or prunes the history breaks the assumption, and breaks
+    // it silently: the stored number then exceeds `session.messages.len()`, `skip`
+    // yields nothing, `count` is zero, and `atoma_runs` gains a record of a run that
+    // apparently never called the model. Nothing errors and nothing warns, so the only
+    // signal is a report that says a run which cost real money did no inference.
+    //
+    // The old comment here defended the read as the better trade: threading a second
+    // parameter through two functions to reach one line, against reading a number that
+    // is already written down. The parameter is the cheaper of the two after all, since
+    // the number written down is written by whoever embeds atoma and was believed
+    // without a check.
     let record = RunRecord {
         seconds: seconds_between(started, &ended),
         started: started.to_string(),
         ended,
         ended_because: ended_because.to_string(),
         messages: session.messages.len(),
-        iterations,
+        iterations: inferences,
     };
     match serde_json::to_value(&record) {
         Ok(value) => runs.push(value),
@@ -282,10 +286,11 @@ fn save_whatever_was_reached(
     port: &dyn SessionPort,
     started: &str,
     ended_because: &str,
+    inferences: usize,
 ) {
     let Some(path) = out_path else { return };
 
-    record_run(session, started, ended_because);
+    record_run(session, started, ended_because, inferences);
 
     let repaired = answer_unanswered_tool_calls(session, TOOL_CALL_UNANSWERED);
     if repaired > 0 {
@@ -471,6 +476,12 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
 
     let out_path = out_session.or(in_session);
 
+    // Written by the loop as it goes, so that it is still right on the paths that never
+    // return an `InferenceResult`: a ceiling reached, a stop file, a provider hanging
+    // up. Zero here is the honest starting value -- a run that fails before its first
+    // response really did make no round trip.
+    let mut inferences: usize = 0;
+
     let inference_result = inference_loop(
         deps.llm,
         &agent.name,
@@ -483,6 +494,7 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
         max_runtime,
         stop_file.as_deref(),
         agent.vision,
+        &mut inferences,
     )
     .await;
 
@@ -510,6 +522,7 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
                 deps.session,
                 &started,
                 "completed",
+                inferences,
             );
             return Ok(RunOutcome::SessionEnded);
         }
@@ -538,6 +551,7 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
                 deps.session,
                 &started,
                 ending_of(&e),
+                inferences,
             );
             return Err(e);
         }
@@ -567,6 +581,7 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
         deps.session,
         &started,
         "completed",
+        inferences,
     );
 
     Ok(RunOutcome::Completed {
@@ -575,4 +590,45 @@ pub async fn run(settings: RunSettings, deps: RunDeps<'_>) -> Result<RunOutcome>
         reason: completion_reason,
         session_path: out_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iterations_of(session: &Session, index: usize) -> Option<u64> {
+        let runs = session
+            .extra
+            .get(RUNS_KEY)
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        runs.get(index)?.get("iterations").and_then(Value::as_u64)
+    }
+
+    /// The case that used to record zero. The previous run wrote `messages: 400`, then
+    /// whoever embeds atoma compacted the history down to one message before this run
+    /// started. The old derivation skipped 400 messages of a one-message session,
+    /// counted nothing, and wrote a run that reads as one that never called the model.
+    #[test]
+    fn a_compacted_history_does_not_erase_this_runs_inferences() {
+        let mut session = Session::default();
+        session.messages.push(Message::assistant(Some("x"), None));
+        let previous = serde_json::json!([{ "messages": 400 }]);
+        session.extra.insert(RUNS_KEY.to_string(), previous);
+
+        record_run(&mut session, "2026-01-01T00:00:00Z", "completed", 7);
+
+        assert_eq!(iterations_of(&session, 1), Some(7));
+    }
+
+    /// The ordinary case, kept beside it: a session with no record of earlier runs
+    /// reports what the loop counted, not what its messages imply.
+    #[test]
+    fn a_first_run_reports_the_count_it_was_given() {
+        let mut session = Session::default();
+
+        record_run(&mut session, "2026-01-01T00:00:00Z", "completed", 3);
+
+        assert_eq!(iterations_of(&session, 0), Some(3));
+    }
 }

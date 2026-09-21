@@ -322,6 +322,14 @@ fn withhold_images(message: &Message) -> Message {
 }
 
 /// Run the inference loop: call LLM, handle tool calls or final response.
+///
+/// `inferences` counts the round trips this run made, and is an out parameter rather
+/// than a field on `InferenceResult` on purpose: every ending that is not a plain
+/// completion leaves this function through `Err` -- the three soft stops and every
+/// failure -- and those are exactly the runs whose inference count is worth having, a
+/// run cut off by `--max-iterations` being the one somebody most wants the size of. A
+/// field on the returned value would only ever describe the runs that finished, while
+/// the caller records a run for all of them.
 #[allow(clippy::too_many_arguments)]
 pub async fn inference_loop(
     llm_client: &dyn LlmPort,
@@ -335,6 +343,7 @@ pub async fn inference_loop(
     max_runtime: Option<Duration>,
     stop_file: Option<&Path>,
     vision: bool,
+    inferences: &mut usize,
 ) -> Result<InferenceResult> {
     let mut total_usage = LlmUsage::default();
     let mut loop_tracker = LoopTracker::default();
@@ -395,6 +404,20 @@ pub async fn inference_loop(
         let response = llm_client
             .chat_completion(model, &outgoing, tool_definitions, extra_body)
             .await?;
+
+        // Counted here, where the round trip actually happened, rather than worked out
+        // afterwards from the session. `record_run` used to read the previous run
+        // record's `messages` value back off disk and count the assistant messages past
+        // it, which assumed the session's `messages` array is only ever appended to
+        // between runs. An embedder that compacts or prunes history makes that stored
+        // number exceed the current length, the skip then yields nothing, and the run is
+        // recorded as having made zero inferences -- no error, no warning, just a run
+        // that reads afterwards as one that never called the model.
+        //
+        // Incremented on the response rather than on an assistant message, so a round
+        // trip that came back empty and was re-requested is counted too: it was waited
+        // on and it was billed, which is what this number claims to measure.
+        *inferences += 1;
 
         if let Some(u) = response.usage {
             // Per inference, not only per run. The run total cannot answer how the
