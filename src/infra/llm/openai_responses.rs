@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::domain::ports::{FinishReason, LlmChoice, LlmPort, LlmResponse, LlmUsage};
 use crate::domain::session::{Message, ToolCall, ToolCallFunction};
 use crate::infra::llm::shared::{
-    merge_extra_body, report_unread_usage, send_json_with_retry, tool_function,
+    merge_extra_body, report_unread_usage, send_json_with_retry, tool_function, ProviderReply,
 };
 
 pub struct OpenAIResponsesClient {
@@ -72,7 +72,7 @@ impl LlmPort for OpenAIResponsesClient {
         tracing::debug!("Request URL: {}", url);
         tracing::debug!("Request body: {}", serde_json::to_string_pretty(&body)?);
 
-        let raw: ResponsesReply = send_json_with_retry("OpenAI Responses", || {
+        let raw: ProviderReply<ResponsesReply> = send_json_with_retry("OpenAI Responses", || {
             let mut request = self
                 .client
                 .post(&url)
@@ -85,7 +85,7 @@ impl LlmPort for OpenAIResponsesClient {
         })
         .await?;
 
-        Ok(reply_to_llm_response(raw))
+        Ok(reply_to_llm_response(raw.body, raw.request_id))
     }
 }
 
@@ -306,7 +306,10 @@ fn tool_output(content: Option<&Value>) -> Value {
 /// calls together, which is the Chat Completions shape. Responses returns the
 /// same information spread across items, so it is gathered here rather than
 /// teaching the loop a second shape it would otherwise never need.
-fn reply_to_llm_response(raw: ResponsesReply) -> LlmResponse {
+///
+/// `request_id` arrives alongside rather than inside `raw`, because it is a header on
+/// the HTTP exchange and not an item in this API's `output`.
+fn reply_to_llm_response(raw: ResponsesReply, request_id: Option<String>) -> LlmResponse {
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     // Everything this adapter does NOT turn into text or a tool call. `reasoning` is
@@ -404,6 +407,7 @@ fn reply_to_llm_response(raw: ResponsesReply) -> LlmResponse {
                 written_prompt_tokens: None,
             }
         }),
+        request_id,
     }
 }
 
@@ -520,7 +524,7 @@ mod tests {
         }))
         .unwrap();
 
-        let response = reply_to_llm_response(raw);
+        let response = reply_to_llm_response(raw, None);
         let choice = &response.choices[0];
         assert_eq!(choice.message.content, Some(json!("done")));
         let calls = choice.message.tool_calls.as_ref().unwrap();
@@ -548,7 +552,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let message = reply_to_llm_response(raw).choices.remove(0).message;
+        let message = reply_to_llm_response(raw, None).choices.remove(0).message;
 
         let carried = message.provider_items.expect("the reasoning item is kept");
         assert_eq!(carried.len(), 1, "{carried:?}");
@@ -602,7 +606,7 @@ mod tests {
             "output": [{"type": "message", "content": [{"text": "hello"}]}]
         }))
         .unwrap();
-        let message = reply_to_llm_response(raw).choices.remove(0).message;
+        let message = reply_to_llm_response(raw, None).choices.remove(0).message;
         assert!(message.provider_items.is_none());
     }
 
@@ -625,7 +629,7 @@ mod tests {
             incomplete_details: None,
             usage: Some(raw),
         };
-        let usage = reply_to_llm_response(reply).usage.expect("usage");
+        let usage = reply_to_llm_response(reply, None).usage.expect("usage");
         assert_eq!(usage.prompt_tokens, 1000);
         // A part of the prompt, not extra beside it.
         assert_eq!(usage.cached_prompt_tokens, Some(800));
@@ -650,7 +654,7 @@ mod tests {
             incomplete_details: None,
             usage: Some(raw),
         };
-        let usage = reply_to_llm_response(reply).usage.expect("usage");
+        let usage = reply_to_llm_response(reply, None).usage.expect("usage");
         assert_eq!(usage.cached_prompt_tokens, None);
     }
 
@@ -662,7 +666,7 @@ mod tests {
             "incomplete_details": {"reason": "max_output_tokens"},
         }))
         .unwrap();
-        let response = reply_to_llm_response(raw);
+        let response = reply_to_llm_response(raw, None);
         assert_eq!(
             response.choices[0].finish_reason,
             Some(FinishReason::Length)

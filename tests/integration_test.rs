@@ -907,6 +907,7 @@ async fn test_content_filter_returns_error() {
                     finish_reason: Some(FinishReason::ContentFilter),
                 }],
                 usage: None,
+                request_id: None,
             })
         }
     }
@@ -975,6 +976,7 @@ async fn test_truncated_response_reports_length_reason() {
                     finish_reason: Some(FinishReason::Length),
                 }],
                 usage: None,
+                request_id: None,
             })
         }
     }
@@ -1047,6 +1049,7 @@ async fn test_prompt_file_is_appended_and_persisted() {
                     finish_reason: Some(FinishReason::Stop),
                 }],
                 usage: None,
+                request_id: None,
             })
         }
     }

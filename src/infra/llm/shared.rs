@@ -202,6 +202,66 @@ pub struct PromptTokensDetails {
     pub cached_tokens: Option<u64>,
 }
 
+/// What a provider sent back: the body an adapter asked for, and what that provider
+/// calls the request which produced it.
+///
+/// A pair rather than a second request function, because the id is not an extra fact
+/// about some calls -- it is how any one call is named afterwards, and a function that
+/// returns the body alone is exactly what dropped it. Every caller of
+/// [`send_json_with_retry`] is an adapter assembling an `LlmResponse`, and all three
+/// have somewhere to put it.
+///
+/// `Debug` because a test asserting on a failed call unwraps the error, which asks the
+/// success type to be printable.
+#[derive(Debug)]
+pub struct ProviderReply<T> {
+    pub body: T,
+    /// The provider's id for this request, or `None` if it sent none this adapter
+    /// reads. See `LlmResponse::request_id` for why absent must stay absent.
+    pub request_id: Option<String>,
+}
+
+/// Header names a provider returns its own request id under, tried in order.
+///
+/// One shared list rather than a name per adapter, and that is a deliberate departure
+/// from where dialect differences usually live. The spelling is chosen by the endpoint
+/// that answers, not by the wire format it speaks: `openai_compat_call` alone carries
+/// OpenAI, OpenRouter, orcarouter and GitHub Copilot, and `PROVIDERS` documents
+/// `OPENAI_BASE_URL` as the way to reach any other host speaking either dialect. An
+/// adapter asked to name "its" header would therefore be answering for a host it does
+/// not know, and would be wrong in precisely the case that table exists to support.
+///
+/// - `x-request-id` is OpenAI's, and what endpoints built to its shape return with it.
+/// - `request-id` is Anthropic's -- the id its support asks for.
+/// - `apim-request-id` and `x-ms-request-id` are Azure OpenAI's, reachable here by
+///   pointing `OPENAI_BASE_URL` at a deployment.
+///
+/// First match wins. A gateway that stamps its own `x-request-id` in front of an
+/// upstream's id answers for itself, which is the right answer: that gateway is the
+/// party a support conversation would be had with.
+///
+/// A provider spelling it something absent from this list reports the same silence as
+/// one that sends no id at all, and the fix is a line here rather than anything
+/// structural.
+const REQUEST_ID_HEADERS: [&str; 4] = [
+    "x-request-id",
+    "request-id",
+    "apim-request-id",
+    "x-ms-request-id",
+];
+
+/// The provider's id for a response, read off the headers before anything consumes it.
+fn provider_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    REQUEST_ID_HEADERS
+        .iter()
+        .find_map(|name| headers.get(*name)?.to_str().ok())
+        // A header present but empty is not an id. Without this the blank is carried
+        // all the way into the log line, which prints `request=` followed by nothing --
+        // the exact shape three doc comments here promise never to produce.
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// POST a request and deserialize its JSON body, retrying transport-level
 /// failures.
 ///
@@ -212,10 +272,14 @@ pub struct PromptTokensDetails {
 /// truncated response body. Not retried: any other status, a provider error
 /// object returned under HTTP 200, and a structurally invalid payload — see
 /// [`is_truncated`].
+///
+/// Returns the headers' correlation key alongside the body. It used to return the
+/// body alone, so the request id arrived in this process and was dropped one line
+/// before anything could keep it — see [`ProviderReply`].
 pub(crate) async fn send_json_with_retry<T: DeserializeOwned>(
     label: &str,
     build_request: impl Fn() -> reqwest::RequestBuilder,
-) -> Result<T> {
+) -> Result<ProviderReply<T>> {
     for attempt in 1..=MAX_HTTP_ATTEMPTS {
         let response = match build_request().send().await {
             Ok(response) => response,
@@ -227,6 +291,10 @@ pub(crate) async fn send_json_with_retry<T: DeserializeOwned>(
                 return Err(error).with_context(|| format!("Failed to send {label} request"))
             }
         };
+
+        // Read before anything consumes the response: `text()` takes it by value, and
+        // the headers are the only place the correlation key ever appears.
+        let request_id = provider_request_id(response.headers());
 
         if !response.status().is_success() {
             let status = response.status();
@@ -244,7 +312,19 @@ pub(crate) async fn send_json_with_retry<T: DeserializeOwned>(
                 .await;
                 continue;
             }
-            anyhow::bail!("{} API error ({}): {}", label, status, error_text);
+            // The refused call named, when the provider named it. A status and a
+            // sentence of error text is all a killed run leaves behind, and on its own
+            // it does not say which of the provider's records to ask about.
+            let attribution = request_id
+                .as_deref()
+                .map_or_else(String::new, |id| format!(" [request {id}]"));
+            anyhow::bail!(
+                "{} API error ({}){}: {}",
+                label,
+                status,
+                attribution,
+                error_text
+            );
         }
 
         let body = match response.text().await {
@@ -274,7 +354,12 @@ pub(crate) async fn send_json_with_retry<T: DeserializeOwned>(
         }
 
         match serde_json::from_str::<T>(&body) {
-            Ok(parsed) => return Ok(parsed),
+            Ok(parsed) => {
+                return Ok(ProviderReply {
+                    body: parsed,
+                    request_id,
+                })
+            }
             Err(error) if attempt < MAX_HTTP_ATTEMPTS && is_truncated(&error) => {
                 retry_delay(attempt, &format!("truncated response body: {error}")).await;
             }
@@ -408,6 +493,10 @@ fn split_images_out_of_tool_message(message: Value) -> Vec<Value> {
 }
 
 /// Shared OpenAI-compatible HTTP call used by OpenAI and Copilot providers.
+///
+/// Returns the reply with the provider's request id beside it, because the four
+/// vendors reached through here are four different support conversations and each
+/// needs its own side of the call named.
 #[allow(clippy::too_many_arguments)]
 pub async fn openai_compat_call(
     client: &reqwest::Client,
@@ -418,7 +507,7 @@ pub async fn openai_compat_call(
     messages: &[Message],
     tools: Option<&[Value]>,
     extra_body: &std::collections::HashMap<String, Value>,
-) -> Result<ChatResponse> {
+) -> Result<ProviderReply<ChatResponse>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let llm_messages: Vec<Value> = messages
@@ -490,7 +579,11 @@ pub(crate) fn report_unread_usage(unread: &BTreeMap<String, Value>) {
     });
 }
 
-pub fn chat_response_to_llm(resp: ChatResponse) -> LlmResponse {
+/// `request_id` is passed beside the body rather than carried inside `ChatResponse`,
+/// because it is not part of this dialect's payload: it arrives in a header, and the
+/// Anthropic adapter — which produces a `ChatResponse` by translation rather than by
+/// deserialising one — has it in hand at the same point.
+pub fn chat_response_to_llm(resp: ChatResponse, request_id: Option<String>) -> LlmResponse {
     LlmResponse {
         choices: resp
             .choices
@@ -523,6 +616,7 @@ pub fn chat_response_to_llm(resp: ChatResponse) -> LlmResponse {
                 written_prompt_tokens: u.prompt_cache_write_tokens,
             }
         }),
+        request_id,
     }
 }
 
@@ -543,6 +637,17 @@ mod tests {
         format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
+            body,
+        )
+    }
+
+    /// The same, with one extra header line written verbatim -- which is how a
+    /// provider's correlation key actually arrives.
+    fn http_200_with(header: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            header,
             body,
         )
     }
@@ -578,7 +683,7 @@ mod tests {
         (handle, address, requests)
     }
 
-    async fn call(address: std::net::SocketAddr) -> Result<ChatResponse> {
+    async fn call(address: std::net::SocketAddr) -> Result<ProviderReply<ChatResponse>> {
         openai_compat_call(
             &reqwest::Client::new(),
             &format!("http://{address}"),
@@ -605,7 +710,7 @@ mod tests {
 
         server.await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 2);
-        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.body.choices.len(), 1);
     }
 
     #[tokio::test]
@@ -624,7 +729,7 @@ mod tests {
             2,
             "truncated JSON should be retried once"
         );
-        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.body.choices.len(), 1);
     }
 
     #[tokio::test]
@@ -664,6 +769,90 @@ mod tests {
         assert!(rendered.contains("upstream timed out"), "got: {rendered}");
         assert!(rendered.contains("504"), "got: {rendered}");
         server.abort();
+    }
+
+    /// The provider's own name for this request, kept rather than dropped with the
+    /// rest of the headers.
+    ///
+    /// It is the only thing that lets one inference here and one record on the
+    /// provider's side be shown to be the same call. Without it, "the cache hit on
+    /// this turn and missed on the next" is a conclusion drawn from our own numbers
+    /// and cannot be checked against theirs.
+    #[tokio::test]
+    async fn a_providers_request_id_is_read_off_the_response() {
+        let served = http_200_with("x-request-id: req_0123456789", VALID_BODY);
+        let (server, address, _) = spawn_server(vec![served]);
+
+        let reply = call(address).await.unwrap();
+
+        server.await.unwrap();
+        assert_eq!(reply.request_id.as_deref(), Some("req_0123456789"));
+    }
+
+    /// Anthropic spells it without the prefix, so both spellings are read here.
+    ///
+    /// Which one arrives is the answering endpoint's choice, not the dialect's: this
+    /// call speaks chat-completions and still finds it, which is the point of keeping
+    /// the names in one list instead of one per adapter.
+    #[tokio::test]
+    async fn the_unprefixed_spelling_is_read_as_well() {
+        let served = http_200_with("request-id: req_anthropic", VALID_BODY);
+        let (server, address, _) = spawn_server(vec![served]);
+
+        let reply = call(address).await.unwrap();
+
+        server.await.unwrap();
+        assert_eq!(reply.request_id.as_deref(), Some("req_anthropic"));
+    }
+
+    /// A provider that sends none reports none. An empty string would read as an
+    /// identifier -- one that no support conversation could ever find, asked about by
+    /// somebody who believed they had one.
+    #[tokio::test]
+    async fn a_response_without_one_is_recorded_as_absent_rather_than_blank() {
+        let (server, address, _) = spawn_server(vec![http_200(VALID_BODY)]);
+
+        let reply = call(address).await.unwrap();
+
+        server.await.unwrap();
+        assert_eq!(reply.request_id, None);
+    }
+
+    /// A header that is present and empty is not an id. A gateway that answers
+    /// `x-request-id:` with nothing after it used to reach `LlmResponse` as
+    /// `Some("")`, and the log line then printed `request=` followed by nothing --
+    /// which reads as a measurement rather than as the absence it is. The test above
+    /// does not cover it: there the header is missing, not blank.
+    #[tokio::test]
+    async fn a_header_that_is_present_and_empty_is_absent_too() {
+        let served = http_200_with("x-request-id:", VALID_BODY);
+        let (server, address, _) = spawn_server(vec![served]);
+
+        let reply = call(address).await.unwrap();
+
+        server.await.unwrap();
+        assert_eq!(reply.request_id, None);
+    }
+
+    /// The failing side needs it at least as much: a 400 kills the run, and the
+    /// status and error text alone do not say which of the provider's records to ask
+    /// about.
+    #[tokio::test]
+    async fn a_refused_request_names_itself_in_the_error() {
+        let body = r#"{"error":"bad request"}"#;
+        let served = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nx-request-id: req_refused\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        let (server, address, _) = spawn_server(vec![served]);
+
+        let error = call(address).await.unwrap_err();
+
+        server.await.unwrap();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("req_refused"), "got: {rendered}");
     }
 
     fn body_with_runtime_tools() -> serde_json::Map<String, Value> {
@@ -811,7 +1000,7 @@ mod tests {
         }))
         .unwrap();
 
-        let usage = chat_response_to_llm(resp).usage.expect("usage");
+        let usage = chat_response_to_llm(resp, None).usage.expect("usage");
         // 800 of the 1000, not 1800: this dialect counts the cached part inside.
         assert_eq!(usage.prompt_tokens, 1000);
         assert_eq!(usage.cached_prompt_tokens, Some(800));
@@ -830,7 +1019,7 @@ mod tests {
         }))
         .unwrap();
 
-        let usage = chat_response_to_llm(resp).usage.expect("usage");
+        let usage = chat_response_to_llm(resp, None).usage.expect("usage");
         assert_eq!(usage.cached_prompt_tokens, None);
     }
 
@@ -861,7 +1050,7 @@ mod tests {
         // Still unknown, because nothing here reads those names -- but now the run
         // says which names it saw instead of leaving it to be guessed.
         assert_eq!(
-            chat_response_to_llm(resp)
+            chat_response_to_llm(resp, None)
                 .usage
                 .expect("usage")
                 .cached_prompt_tokens,
@@ -891,7 +1080,10 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(chat_response_to_llm(resp).choices[0].finish_reason, None);
+        assert_eq!(
+            chat_response_to_llm(resp, None).choices[0].finish_reason,
+            None
+        );
     }
 }
 

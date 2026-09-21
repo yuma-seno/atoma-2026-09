@@ -34,6 +34,7 @@ impl MockLlmClient {
                 cached_prompt_tokens: None,
                 written_prompt_tokens: None,
             }),
+            request_id: None,
         };
         self.queue.lock().unwrap().push_back(response);
         self
@@ -56,6 +57,7 @@ impl MockLlmClient {
                 finish_reason: Some(FinishReason::ToolCalls),
             }],
             usage: None,
+            request_id: None,
         };
         self.queue.lock().unwrap().push_back(response);
         self

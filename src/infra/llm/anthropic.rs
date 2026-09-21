@@ -7,7 +7,7 @@ use crate::domain::ports::{LlmPort, LlmResponse};
 use crate::domain::session::{Message, ToolCall, ToolCallFunction};
 use crate::infra::llm::shared::{
     chat_response_to_llm, send_json_with_retry, tool_function, ChatChoice, ChatResponse,
-    PromptTokensDetails, Usage, RESERVED_KEYS,
+    PromptTokensDetails, ProviderReply, Usage, RESERVED_KEYS,
 };
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -44,14 +44,14 @@ impl AnthropicClient {
         messages: &[Message],
         tools: Option<&[Value]>,
         extra_body: &std::collections::HashMap<String, Value>,
-    ) -> Result<ChatResponse> {
+    ) -> Result<ProviderReply<ChatResponse>> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = build_request_body(model, messages, tools, extra_body)?;
 
         tracing::debug!("Request URL: {}", url);
         tracing::debug!("Request body: {}", serde_json::to_string_pretty(&body)?);
 
-        let raw: AnthropicResponse = send_json_with_retry("Anthropic", || {
+        let raw: ProviderReply<AnthropicResponse> = send_json_with_retry("Anthropic", || {
             let mut request = self
                 .client
                 .post(&url)
@@ -65,7 +65,14 @@ impl AnthropicClient {
         })
         .await?;
 
-        Ok(anthropic_to_chat_response(raw))
+        // The id travels beside the translation rather than through it: this API's
+        // reply has no field for it, and the translation's output is the shared
+        // chat-completions shape, which has none either. It is a property of the HTTP
+        // exchange, and that is the level it is kept at.
+        Ok(ProviderReply {
+            body: anthropic_to_chat_response(raw.body),
+            request_id: raw.request_id,
+        })
     }
 }
 
@@ -78,10 +85,10 @@ impl LlmPort for AnthropicClient {
         tools: Option<&[Value]>,
         extra_body: &std::collections::HashMap<String, Value>,
     ) -> Result<LlmResponse> {
-        let resp = self
+        let reply = self
             .call_anthropic(model, messages, tools, extra_body)
             .await?;
-        Ok(chat_response_to_llm(resp))
+        Ok(chat_response_to_llm(reply.body, reply.request_id))
     }
 }
 

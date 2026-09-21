@@ -92,7 +92,7 @@ impl LlmPort for CopilotClient {
         tools: Option<&[Value]>,
         extra_body: &std::collections::HashMap<String, Value>,
     ) -> Result<LlmResponse> {
-        let resp = openai_compat_call(
+        let reply = openai_compat_call(
             &self.client,
             &self.base_url,
             &self.copilot_token,
@@ -104,6 +104,6 @@ impl LlmPort for CopilotClient {
         )
         .await?;
 
-        Ok(chat_response_to_llm(resp))
+        Ok(chat_response_to_llm(reply.body, reply.request_id))
     }
 }

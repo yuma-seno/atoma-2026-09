@@ -15,6 +15,25 @@ use crate::domain::tool::ToolDef;
 pub struct LlmResponse {
     pub choices: Vec<LlmChoice>,
     pub usage: Option<LlmUsage>,
+    /// The provider's own identifier for the request that produced this response.
+    ///
+    /// A provider that has one returns it in a response header, and every adapter here
+    /// threw it away: `send_json_with_retry` read the body and dropped the headers. That
+    /// left one half of a support conversation impossible to have. A run could record
+    /// that an inference was billed as fresh, or that a 400 killed it, and could not say
+    /// WHICH request on the provider's side that was -- so "why did the cache hit on one
+    /// turn and miss on the next" stayed an inference from our own numbers rather than a
+    /// question the provider could answer about a specific call.
+    ///
+    /// `None` when the provider returned no header any adapter here reads. That is a
+    /// statement about the report rather than a value, and it is kept apart from an
+    /// id the same way `LlmUsage::cached_prompt_tokens` is kept apart from zero: an
+    /// empty string would read as an identifier, and would be carried into a support
+    /// conversation that could never find it.
+    ///
+    /// Atoma records it and acts on nothing. What to do with a correlation key belongs
+    /// to whoever reads the log.
+    pub request_id: Option<String>,
 }
 
 /// A single choice returned by the LLM.

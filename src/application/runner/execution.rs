@@ -403,8 +403,17 @@ pub async fn inference_loop(
             // Answering it once meant parsing a workflow log for iteration timestamps
             // and guessing at a characters-per-token ratio, which was wrong by three
             // times and was believed for an hour.
+            //
+            // `request=` is the provider's own id for this one call, and it is here
+            // because this line is already the per-inference record -- a second line
+            // saying the same thing about the same call would have to be joined back
+            // up by iteration number. It says `unknown` when the provider returned no
+            // id, on the same rule as `cached=`: an empty value would read as an
+            // identifier that no support conversation could find. What it buys is the
+            // step from "this iteration was billed as fresh" to a question the
+            // provider can answer about a specific request of theirs.
             tracing::info!(
-                "ATOMA_INFERENCE_USAGE: iteration={} prompt={} completion={} cached={} written={}",
+                "ATOMA_INFERENCE_USAGE: iteration={} prompt={} completion={} cached={} written={} request={}",
                 iteration,
                 u.prompt_tokens,
                 u.completion_tokens,
@@ -412,6 +421,7 @@ pub async fn inference_loop(
                     .map_or_else(|| "unknown".to_string(), |n| n.to_string()),
                 u.written_prompt_tokens
                     .map_or_else(|| "unknown".to_string(), |n| n.to_string()),
+                response.request_id.as_deref().unwrap_or("unknown"),
             );
             total_usage.prompt_tokens += u.prompt_tokens;
             total_usage.completion_tokens += u.completion_tokens;
