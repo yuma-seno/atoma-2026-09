@@ -22,16 +22,29 @@ use crate::domain::agent::AgentDef;
 use crate::domain::agent::ParsedAgentDef;
 use crate::domain::skill::SkillMetadata;
 
+/// The system prompt a run gets when the caller passes no `--template`.
+///
+/// It says what atoma provides, and nothing else. It used to also teach a handover
+/// convention -- "include a `/agent-name` command in your output text" -- and claim
+/// that agents share memory. atoma implements neither: nothing here reads a model's
+/// output text looking for a command, and there is no shared memory. The only
+/// implementation of that convention lives in an embedder, which passes its own
+/// `--template` and so never saw these lines. Everyone else was the reader.
+///
+/// The example was wrong as well. The one parser that exists matches a whole line
+/// against `^/([a-z][a-z0-9-]*)$`, and `/ReviewAgent Please review...` fails it twice --
+/// for the capitals and for the text after the name.
+///
+/// `{{COLLEAGUES_LIST}}` stays. Who else works here is a fact about the environment;
+/// how work reaches them is not, so an embedder that implements a handover says so in
+/// its own template.
 static DEFAULT_TEMPLATE: &str = r#"# Identity & Purpose
 You are "{{AGENT_NAME}}".
 
 {{AGENT_ROLE_PROMPT}}
 
-You are an autonomous AI agent that uses shared memory to collaborate asynchronously with human users and other AI agents to solve tasks.
-
 # Available Colleagues
-If you cannot complete a task on your own, you may delegate or request assistance from the following colleagues.
-To make a request, include a `/agent-name` command in your output text (e.g. `/ReviewAgent Please review from a performance perspective`).
+Other agents work in this environment. Below is who they are and what each one does.
 
 {{COLLEAGUES_LIST}}
 
@@ -58,13 +71,13 @@ Before taking action or generating final output, always use the `<thought>` tag 
 1. [Analyze]: Analyze the current context, requirements, and environment state.
 2. [Plan]: Plan the next steps to execute based on your role and available tools.
 3. [Act & Verify]: Execute tools and verify results. If errors or unexpected results occur, analyze the cause and re-execute. Do not proceed based on assumptions.
-4. [Communicate]: Determine task completion, blockage status, and what text to output (including which agent to call).
+4. [Communicate]: Determine task completion, blockage status, and what text to output.
 </thought>
 
 # Strict Rules
 - [Tone] Eliminate all greetings, unnecessary apologies, and verbose explanations. Communicate in a technical and concise manner.
 - [Tool Trustworthiness] Do not fabricate (hallucinate) file contents or execution results.
-- [Autonomy & Coordination] Do not repeatedly call yourself or other agents without purpose (no infinite loops). Use `/` commands only when there is a clear request to make.
+- [Autonomy & Coordination] Do not repeatedly call yourself or other agents without purpose (no infinite loops).
 "#;
 
 /// Everything a template may say, as one list.
